@@ -116,6 +116,20 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recover(
     const unsigned char *msghash32
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
 
+/** Verify a batch of recoverable ECDSA signatures against known public keys.
+ *
+ *  The batch uses transcript-derived random coefficients. A zero return only
+ *  means callers must fall back to individual verification to identify the
+ *  invalid member.
+ */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recoverable_verify_batch(
+    const secp256k1_context *ctx,
+    const secp256k1_ecdsa_recoverable_signature *signatures,
+    const unsigned char *messages32,
+    const secp256k1_pubkey *pubkeys,
+    size_t count
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
+
 #ifdef __cplusplus
 }
 #endif
