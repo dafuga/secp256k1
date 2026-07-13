@@ -161,6 +161,16 @@ typedef struct {
     secp256k1_ge *points;
 } secp256k1_ecdsa_batch_data;
 
+struct secp256k1_ecdsa_recoverable_batch_workspace_struct {
+    secp256k1_scalar *scalars;
+    secp256k1_ge *points;
+    secp256k1_scratch *scratch;
+    size_t capacity;
+#ifdef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+    unsigned char coefficient_pair[32];
+#endif
+};
+
 static int secp256k1_ecdsa_batch_callback(secp256k1_scalar *scalar, secp256k1_ge *point,
                                            size_t idx, void *data) {
     secp256k1_ecdsa_batch_data *batch = (secp256k1_ecdsa_batch_data *)data;
@@ -169,31 +179,79 @@ static int secp256k1_ecdsa_batch_callback(secp256k1_scalar *scalar, secp256k1_ge
     return 1;
 }
 
-int secp256k1_ecdsa_recoverable_verify_batch(const secp256k1_context *ctx,
+secp256k1_ecdsa_recoverable_batch_workspace *secp256k1_ecdsa_recoverable_batch_workspace_create(
+        const secp256k1_context *ctx, size_t capacity) {
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace = NULL;
+    size_t scratch_size;
+
+    VERIFY_CHECK(ctx != NULL);
+    if (capacity == 0 || capacity > SIZE_MAX / (2 * sizeof(*workspace->scalars)) ||
+        capacity > SIZE_MAX / (2 * sizeof(*workspace->points)) ||
+        capacity > (SIZE_MAX - 1024 * 1024) / 4096) {
+        return NULL;
+    }
+
+    workspace = (secp256k1_ecdsa_recoverable_batch_workspace *)malloc(sizeof(*workspace));
+    if (workspace == NULL) return NULL;
+    memset(workspace, 0, sizeof(*workspace));
+    workspace->capacity = capacity;
+    workspace->scalars = (secp256k1_scalar *)malloc(2 * capacity * sizeof(*workspace->scalars));
+    workspace->points = (secp256k1_ge *)malloc(2 * capacity * sizeof(*workspace->points));
+    scratch_size = 1024 * 1024 + capacity * 4096;
+    workspace->scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
+    if (workspace->scalars == NULL || workspace->points == NULL || workspace->scratch == NULL) {
+        secp256k1_ecdsa_recoverable_batch_workspace_destroy(ctx, workspace);
+        return NULL;
+    }
+    return workspace;
+}
+
+void secp256k1_ecdsa_recoverable_batch_workspace_destroy(
+        const secp256k1_context *ctx,
+        secp256k1_ecdsa_recoverable_batch_workspace *workspace) {
+    VERIFY_CHECK(ctx != NULL);
+    if (workspace == NULL) return;
+    if (workspace->scratch != NULL) {
+        secp256k1_scratch_destroy(&ctx->error_callback, workspace->scratch);
+    }
+    free(workspace->scalars);
+    free(workspace->points);
+    free(workspace);
+}
+
+int secp256k1_ecdsa_recoverable_verify_batch_workspace(
+                                              const secp256k1_context *ctx,
+                                              secp256k1_ecdsa_recoverable_batch_workspace *workspace,
                                               const secp256k1_ecdsa_recoverable_signature *signatures,
                                               const unsigned char *messages32,
                                               const secp256k1_pubkey *pubkeys,
                                               size_t count) {
+#ifdef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+    static const unsigned char domain[] = "Harbor/K1BatchVerify/128/v1";
+#else
     static const unsigned char domain[] = "Harbor/K1BatchVerify/v1";
+#endif
     secp256k1_ecdsa_batch_data batch;
     secp256k1_scalar g_scalar = secp256k1_scalar_zero;
     secp256k1_gej result;
-    secp256k1_scratch *scratch = NULL;
     secp256k1_sha256 transcript;
+#ifndef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+    secp256k1_sha256 coefficient_prefix;
+#endif
     unsigned char transcript_hash[32];
     size_t i;
     int ok = 0;
 
     VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(workspace != NULL);
     ARG_CHECK(signatures != NULL);
     ARG_CHECK(messages32 != NULL);
     ARG_CHECK(pubkeys != NULL);
     if (count == 0) return 1;
-    if (count > SIZE_MAX / (2 * sizeof(*batch.scalars))) return 0;
+    if (count > workspace->capacity) return 0;
 
-    batch.scalars = (secp256k1_scalar *)malloc(2 * count * sizeof(*batch.scalars));
-    batch.points = (secp256k1_ge *)malloc(2 * count * sizeof(*batch.points));
-    if (batch.scalars == NULL || batch.points == NULL) goto cleanup;
+    batch.scalars = workspace->scalars;
+    batch.points = workspace->points;
 
     secp256k1_sha256_initialize(&transcript);
     secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &transcript, domain, sizeof(domain) - 1);
@@ -201,6 +259,12 @@ int secp256k1_ecdsa_recoverable_verify_batch(const secp256k1_context *ctx,
     secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &transcript, messages32, count * 32);
     secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &transcript, (const unsigned char *)pubkeys, count * sizeof(*pubkeys));
     secp256k1_sha256_finalize(secp256k1_get_hash_context(ctx), &transcript, transcript_hash);
+
+#ifndef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+    secp256k1_sha256_initialize(&coefficient_prefix);
+    secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_prefix,
+                           transcript_hash, sizeof(transcript_hash));
+#endif
 
     for (i = 0; i < count; ++i) {
         secp256k1_scalar r, s, z, coefficient, term;
@@ -229,12 +293,30 @@ int secp256k1_ecdsa_recoverable_verify_batch(const secp256k1_context *ctx,
         if (!secp256k1_ge_set_xo_var(&batch.points[2 * i], &x, recid & 1)) goto cleanup;
         if (!secp256k1_pubkey_load(ctx, &batch.points[2 * i + 1], &pubkeys[i])) goto cleanup;
 
+#ifdef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+        if ((i & 1U) == 0) {
+            const size_t coefficient_pair = i / 2;
+            for (j = 0; j < sizeof(index_bytes); ++j)
+                index_bytes[sizeof(index_bytes) - 1 - j] = (unsigned char)(coefficient_pair >> (8 * j));
+            secp256k1_sha256_initialize(&coefficient_hash);
+            secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                                   transcript_hash, sizeof(transcript_hash));
+            secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                                   index_bytes, sizeof(index_bytes));
+            secp256k1_sha256_finalize(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                                     workspace->coefficient_pair);
+        }
+        memset(coefficient_bytes, 0, 16);
+        memcpy(coefficient_bytes + 16, workspace->coefficient_pair + ((i & 1U) ? 16 : 0), 16);
+#else
         for (j = 0; j < sizeof(index_bytes); ++j)
             index_bytes[sizeof(index_bytes) - 1 - j] = (unsigned char)(i >> (8 * j));
-        secp256k1_sha256_initialize(&coefficient_hash);
-        secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_hash, transcript_hash, sizeof(transcript_hash));
-        secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_hash, index_bytes, sizeof(index_bytes));
-        secp256k1_sha256_finalize(secp256k1_get_hash_context(ctx), &coefficient_hash, coefficient_bytes);
+        coefficient_hash = coefficient_prefix;
+        secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                               index_bytes, sizeof(index_bytes));
+        secp256k1_sha256_finalize(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                                 coefficient_bytes);
+#endif
         secp256k1_scalar_set_b32(&coefficient, coefficient_bytes, &overflow);
         if (overflow || secp256k1_scalar_is_zero(&coefficient))
             secp256k1_scalar_set_int(&coefficient, 1);
@@ -248,16 +330,33 @@ int secp256k1_ecdsa_recoverable_verify_batch(const secp256k1_context *ctx,
     }
     secp256k1_scalar_negate(&g_scalar, &g_scalar);
 
-    scratch = secp256k1_scratch_create(&ctx->error_callback, 1024 * 1024 + count * 4096);
-    if (scratch == NULL) goto cleanup;
-    if (!secp256k1_ecmult_multi_var(&ctx->error_callback, scratch, &result, &g_scalar,
+    if (!secp256k1_ecmult_multi_var(&ctx->error_callback, workspace->scratch, &result, &g_scalar,
                                     secp256k1_ecdsa_batch_callback, &batch, 2 * count)) goto cleanup;
     ok = secp256k1_gej_is_infinity(&result);
 
 cleanup:
-    if (scratch != NULL) secp256k1_scratch_destroy(&ctx->error_callback, scratch);
-    free(batch.scalars);
-    free(batch.points);
+    return ok;
+}
+
+int secp256k1_ecdsa_recoverable_verify_batch(const secp256k1_context *ctx,
+                                              const secp256k1_ecdsa_recoverable_signature *signatures,
+                                              const unsigned char *messages32,
+                                              const secp256k1_pubkey *pubkeys,
+                                              size_t count) {
+    int ok;
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace;
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(signatures != NULL);
+    ARG_CHECK(messages32 != NULL);
+    ARG_CHECK(pubkeys != NULL);
+    if (count == 0) return 1;
+
+    workspace = secp256k1_ecdsa_recoverable_batch_workspace_create(ctx, count);
+    if (workspace == NULL) return 0;
+    ok = secp256k1_ecdsa_recoverable_verify_batch_workspace(
+        ctx, workspace, signatures, messages32, pubkeys, count);
+    secp256k1_ecdsa_recoverable_batch_workspace_destroy(ctx, workspace);
     return ok;
 }
 

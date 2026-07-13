@@ -53,6 +53,12 @@
 
 /* Minimum number of points for which pippenger_wnaf is faster than strauss wnaf */
 #define ECMULT_PIPPENGER_THRESHOLD 88
+#ifndef HARBOR_SECP256K1_PIPPENGER_11_FROM_POINTS
+#define HARBOR_SECP256K1_PIPPENGER_11_FROM_POINTS 7881
+#endif
+#ifndef HARBOR_SECP256K1_PIPPENGER_12_FROM_POINTS
+#define HARBOR_SECP256K1_PIPPENGER_12_FROM_POINTS 16051
+#endif
 
 #define ECMULT_MAX_POINTS_PER_BATCH 5000000
 
@@ -611,9 +617,9 @@ static int secp256k1_pippenger_bucket_window(size_t n) {
         return 7;
     } else if (n <= 4420) {
         return 9;
-    } else if (n <= 7880) {
+    } else if (n < HARBOR_SECP256K1_PIPPENGER_11_FROM_POINTS) {
         return 10;
-    } else if (n <= 16050) {
+    } else if (n < HARBOR_SECP256K1_PIPPENGER_12_FROM_POINTS) {
         return 11;
     } else {
         return PIPPENGER_MAX_BUCKET_WINDOW;
@@ -634,8 +640,8 @@ static size_t secp256k1_pippenger_bucket_window_inv(int bucket_window) {
         case 7: return 1260;
         case 8: return 1260;
         case 9: return 4420;
-        case 10: return 7880;
-        case 11: return 16050;
+        case 10: return HARBOR_SECP256K1_PIPPENGER_11_FROM_POINTS - 1;
+        case 11: return HARBOR_SECP256K1_PIPPENGER_12_FROM_POINTS - 1;
         case PIPPENGER_MAX_BUCKET_WINDOW: return SIZE_MAX;
     }
     return 0;

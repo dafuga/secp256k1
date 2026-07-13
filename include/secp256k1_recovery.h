@@ -130,6 +130,38 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recoverable_verif
     size_t count
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
 
+/** Opaque reusable storage for recoverable ECDSA batch verification.
+ *
+ *  A workspace is not safe for concurrent use. Different threads may use
+ *  different workspaces with the same secp256k1 context.
+ */
+typedef struct secp256k1_ecdsa_recoverable_batch_workspace_struct secp256k1_ecdsa_recoverable_batch_workspace;
+
+/** Create reusable storage for batches up to `capacity` signatures. */
+SECP256K1_API secp256k1_ecdsa_recoverable_batch_workspace *secp256k1_ecdsa_recoverable_batch_workspace_create(
+    const secp256k1_context *ctx,
+    size_t capacity
+) SECP256K1_ARG_NONNULL(1);
+
+/** Destroy a workspace created by secp256k1_ecdsa_recoverable_batch_workspace_create. */
+SECP256K1_API void secp256k1_ecdsa_recoverable_batch_workspace_destroy(
+    const secp256k1_context *ctx,
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace
+) SECP256K1_ARG_NONNULL(1);
+
+/** Verify a batch using caller-owned reusable storage.
+ *
+ *  Returns zero when count exceeds the workspace capacity.
+ */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recoverable_verify_batch_workspace(
+    const secp256k1_context *ctx,
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+    const secp256k1_ecdsa_recoverable_signature *signatures,
+    const unsigned char *messages32,
+    const secp256k1_pubkey *pubkeys,
+    size_t count
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5);
+
 #ifdef __cplusplus
 }
 #endif
