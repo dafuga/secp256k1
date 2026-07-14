@@ -364,6 +364,37 @@ static int secp256k1_ge_set_xo_var(secp256k1_ge *r, const secp256k1_fe *x, int o
     return ret;
 }
 
+#if defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+static int secp256k1_ge_set_xo_var_interleaved(
+        secp256k1_ge r[HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH],
+        const unsigned char odd[HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH]) {
+    secp256k1_fe x3[HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH];
+    secp256k1_fe roots[HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH];
+    size_t i;
+    int ret;
+
+    for (i = 0; i < HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH; ++i) {
+        secp256k1_fe x2;
+        SECP256K1_FE_VERIFY(&r[i].x);
+        secp256k1_fe_sqr(&x2, &r[i].x);
+        secp256k1_fe_mul(&x3[i], &r[i].x, &x2);
+        secp256k1_fe_add_int(&x3[i], SECP256K1_B);
+    }
+
+    ret = secp256k1_fe_sqrt_interleaved(roots, x3);
+    for (i = 0; i < HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH; ++i) {
+        r[i].y = roots[i];
+        r[i].infinity = 0;
+        secp256k1_fe_normalize_var(&r[i].y);
+        if (secp256k1_fe_is_odd(&r[i].y) != odd[i]) {
+            secp256k1_fe_negate(&r[i].y, &r[i].y, 1);
+        }
+        SECP256K1_GE_VERIFY(&r[i]);
+    }
+    return ret;
+}
+#endif
+
 static void secp256k1_gej_set_ge(secp256k1_gej *r, const secp256k1_ge *a) {
    SECP256K1_GE_VERIFY(a);
 
