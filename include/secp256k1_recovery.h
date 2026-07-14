@@ -162,6 +162,41 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recoverable_verif
     size_t count
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5);
 
+/** Verify a batch using externally recovered signature R points.
+ *
+ *  This entry point permits an accelerator to perform point decompression
+ *  while the canonical scalar preparation and multi-scalar multiplication
+ *  remain in libsecp256k1. Every supplied point is checked against the
+ *  corresponding signature's R x-coordinate and normalized recovery parity.
+ *  Returns zero when a supplied point is invalid or mismatched.
+ */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r(
+    const secp256k1_context *ctx,
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+    const secp256k1_ecdsa_recoverable_signature *signatures,
+    const unsigned char *messages32,
+    const secp256k1_pubkey *pubkeys,
+    const secp256k1_pubkey *r_points,
+    size_t count
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6);
+
+/** Verify a batch using canonical externally recovered R coordinates.
+ *
+ *  `r_points64` contains count consecutive 64-byte x||y pairs in big-endian
+ *  field encoding. The points are checked for canonical encoding, curve
+ *  membership, signature-derived x-coordinate, and normalized recovery
+ *  parity before the aggregate verification is attempted.
+ */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r_xy(
+    const secp256k1_context *ctx,
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+    const secp256k1_ecdsa_recoverable_signature *signatures,
+    const unsigned char *messages32,
+    const secp256k1_pubkey *pubkeys,
+    const unsigned char *r_points64,
+    size_t count
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6);
+
 #ifdef __cplusplus
 }
 #endif
