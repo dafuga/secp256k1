@@ -364,16 +364,16 @@ static int secp256k1_ge_set_xo_var(secp256k1_ge *r, const secp256k1_fe *x, int o
     return ret;
 }
 
-#if defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
-static int secp256k1_ge_set_xo_var_interleaved(
-        secp256k1_ge r[HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH],
-        const unsigned char odd[HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH]) {
-    secp256k1_fe x3[HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH];
-    secp256k1_fe roots[HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH];
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
+static int secp256k1_ge_set_xo_var_batch_backend(
+        secp256k1_ge r[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH],
+        const unsigned char odd[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH]) {
+    secp256k1_fe x3[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH];
+    secp256k1_fe roots[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH];
     size_t i;
     int ret;
 
-    for (i = 0; i < HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH; ++i) {
+    for (i = 0; i < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++i) {
         secp256k1_fe x2;
         SECP256K1_FE_VERIFY(&r[i].x);
         secp256k1_fe_sqr(&x2, &r[i].x);
@@ -381,8 +381,8 @@ static int secp256k1_ge_set_xo_var_interleaved(
         secp256k1_fe_add_int(&x3[i], SECP256K1_B);
     }
 
-    ret = secp256k1_fe_sqrt_interleaved(roots, x3);
-    for (i = 0; i < HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH; ++i) {
+    ret = secp256k1_harbor_batch_fe_sqrt(roots, x3);
+    for (i = 0; i < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++i) {
         r[i].y = roots[i];
         r[i].infinity = 0;
         secp256k1_fe_normalize_var(&r[i].y);

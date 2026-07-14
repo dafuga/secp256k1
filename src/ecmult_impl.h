@@ -15,6 +15,7 @@
 #include "scalar.h"
 #include "ecmult.h"
 #include "precomputed_ecmult.h"
+#include "harbor_msm_backend.h"
 
 #if defined(EXHAUSTIVE_TEST_ORDER)
 /* We need to lower these values for exhaustive tests because
@@ -46,7 +47,11 @@
 #define WNAF_SIZE(w) WNAF_SIZE_BITS(WNAF_BITS, w)
 
 /* The number of objects allocated on the scratch space for ecmult_multi algorithms */
+#if defined(HARBOR_SECP256K1_MSM_BACKEND_ENABLED)
+#define PIPPENGER_SCRATCH_OBJECTS 10
+#else
 #define PIPPENGER_SCRATCH_OBJECTS 6
+#endif
 #define STRAUSS_SCRATCH_OBJECTS 5
 
 #define PIPPENGER_MAX_BUCKET_WINDOW 12
@@ -510,6 +515,16 @@ struct secp256k1_pippenger_point_state {
 struct secp256k1_pippenger_state {
     int *wnaf_na;
     struct secp256k1_pippenger_point_state* ps;
+#if defined(HARBOR_SECP256K1_MSM_BACKEND_ENABLED)
+    secp256k1_ge *affine_points;
+    secp256k1_fe *denominators;
+    secp256k1_fe *inverse_prefix;
+    size_t *bucket_counts;
+    size_t *bucket_offsets;
+    size_t *bucket_write;
+    size_t affine_capacity;
+    size_t inverse_capacity;
+#endif
 };
 
 /*
@@ -519,7 +534,7 @@ struct secp256k1_pippenger_state {
  * to the point's wnaf[i]. Second, the buckets are added together such that
  * r += 1*bucket[0] + 3*bucket[1] + 5*bucket[2] + ...
  */
-static int secp256k1_ecmult_pippenger_wnaf(secp256k1_gej *buckets, int bucket_window, struct secp256k1_pippenger_state *state, secp256k1_gej *r, const secp256k1_scalar *sc, const secp256k1_ge *pt, size_t num) {
+static int secp256k1_ecmult_pippenger_wnaf_upstream(secp256k1_gej *buckets, int bucket_window, struct secp256k1_pippenger_state *state, secp256k1_gej *r, const secp256k1_scalar *sc, const secp256k1_ge *pt, size_t num) {
     size_t n_wnaf = WNAF_SIZE(bucket_window+1);
     size_t np;
     size_t no = 0;
@@ -596,6 +611,17 @@ static int secp256k1_ecmult_pippenger_wnaf(secp256k1_gej *buckets, int bucket_wi
     return 1;
 }
 
+#include "harbor_msm_backend_impl.h"
+
+static int secp256k1_ecmult_pippenger_wnaf(secp256k1_gej *buckets, int bucket_window, struct secp256k1_pippenger_state *state, secp256k1_gej *r, const secp256k1_scalar *sc, const secp256k1_ge *pt, size_t num) {
+#if defined(HARBOR_SECP256K1_MSM_BACKEND_ENABLED)
+    if (secp256k1_harbor_ecmult_pippenger_wnaf(buckets, bucket_window, state, r, sc, pt, num)) {
+        return 1;
+    }
+#endif
+    return secp256k1_ecmult_pippenger_wnaf_upstream(buckets, bucket_window, state, r, sc, pt, num);
+}
+
 /**
  * Returns optimal bucket_window (number of bits of a scalar represented by a
  * set of buckets) for a given number of points.
@@ -670,7 +696,13 @@ SECP256K1_INLINE static void secp256k1_ecmult_endo_split(secp256k1_scalar *s1, s
 static size_t secp256k1_pippenger_scratch_size(size_t n_points, int bucket_window) {
     size_t entries = 2*n_points + 2;
     size_t entry_size = sizeof(secp256k1_ge) + sizeof(secp256k1_scalar) + sizeof(struct secp256k1_pippenger_point_state) + (WNAF_SIZE(bucket_window+1)+1)*sizeof(int);
-    return (sizeof(secp256k1_gej) << bucket_window) + sizeof(struct secp256k1_pippenger_state) + entries * entry_size;
+    size_t result = (sizeof(secp256k1_gej) << bucket_window) + sizeof(struct secp256k1_pippenger_state) + entries * entry_size;
+#if defined(HARBOR_SECP256K1_MSM_BACKEND_ENABLED)
+    result += 2 * entries * sizeof(secp256k1_ge);
+    result += 2 * entries * sizeof(secp256k1_fe);
+    result += 3 * ((size_t)1 << bucket_window) * sizeof(size_t);
+#endif
+    return result;
 }
 
 static int secp256k1_ecmult_pippenger_batch(const secp256k1_callback* error_callback, secp256k1_scratch *scratch, secp256k1_gej *r, const secp256k1_scalar *inp_g_sc, secp256k1_ecmult_multi_callback cb, void *cbdata, size_t n_points, size_t cb_offset) {
@@ -707,7 +739,28 @@ static int secp256k1_ecmult_pippenger_batch(const secp256k1_callback* error_call
     state_space->ps = (struct secp256k1_pippenger_point_state *) secp256k1_scratch_alloc(error_callback, scratch, entries * sizeof(*state_space->ps));
     state_space->wnaf_na = (int *) secp256k1_scratch_alloc(error_callback, scratch, entries*(WNAF_SIZE(bucket_window+1)) * sizeof(int));
     buckets = (secp256k1_gej *) secp256k1_scratch_alloc(error_callback, scratch, ((size_t)1 << bucket_window) * sizeof(*buckets));
-    if (state_space->ps == NULL || state_space->wnaf_na == NULL || buckets == NULL) {
+#if defined(HARBOR_SECP256K1_MSM_BACKEND_ENABLED)
+    state_space->affine_capacity = 2 * entries;
+    state_space->inverse_capacity = entries;
+    state_space->affine_points = (secp256k1_ge *)secp256k1_scratch_alloc(
+        error_callback, scratch, state_space->affine_capacity * sizeof(*state_space->affine_points));
+    state_space->denominators = (secp256k1_fe *)secp256k1_scratch_alloc(
+        error_callback, scratch, state_space->inverse_capacity * sizeof(*state_space->denominators));
+    state_space->inverse_prefix = (secp256k1_fe *)secp256k1_scratch_alloc(
+        error_callback, scratch, state_space->inverse_capacity * sizeof(*state_space->inverse_prefix));
+    state_space->bucket_counts = (size_t *)secp256k1_scratch_alloc(
+        error_callback, scratch, 3 * ((size_t)1 << bucket_window) * sizeof(*state_space->bucket_counts));
+    if (state_space->bucket_counts != NULL) {
+        state_space->bucket_offsets = state_space->bucket_counts + ((size_t)1 << bucket_window);
+        state_space->bucket_write = state_space->bucket_offsets + ((size_t)1 << bucket_window);
+    }
+#endif
+    if (state_space->ps == NULL || state_space->wnaf_na == NULL || buckets == NULL
+#if defined(HARBOR_SECP256K1_MSM_BACKEND_ENABLED)
+        || state_space->affine_points == NULL || state_space->denominators == NULL
+        || state_space->inverse_prefix == NULL || state_space->bucket_counts == NULL
+#endif
+        ) {
         secp256k1_scratch_apply_checkpoint(error_callback, scratch, scratch_checkpoint);
         return 0;
     }
@@ -760,6 +813,11 @@ static size_t secp256k1_pippenger_max_points(const secp256k1_callback* error_cal
 
         entry_size = 2*entry_size;
         space_overhead = (sizeof(secp256k1_gej) << bucket_window) + entry_size + sizeof(struct secp256k1_pippenger_state);
+#if defined(HARBOR_SECP256K1_MSM_BACKEND_ENABLED)
+        entry_size += 4 * sizeof(secp256k1_ge) + 4 * sizeof(secp256k1_fe);
+        space_overhead += 4 * sizeof(secp256k1_ge) + 4 * sizeof(secp256k1_fe);
+        space_overhead += 3 * ((size_t)1 << bucket_window) * sizeof(size_t);
+#endif
         if (space_overhead > max_alloc) {
             break;
         }

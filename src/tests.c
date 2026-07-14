@@ -3459,6 +3459,76 @@ static void run_sqrt(void) {
     }
 }
 
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ARM64_NEON)
+static void run_harbor_arm64_batch_field_backend(void) {
+    {
+        static const uint64_t inputs[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH] = {
+            0, 1, 0x123456789abULL, 0x3ffffffffffULL
+        };
+        uint64_t outputs[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH];
+        secp256k1_harbor_u64x4 value, product;
+        size_t lane;
+        value.lo = vld1q_u64(inputs);
+        value.hi = vld1q_u64(inputs + 2);
+        product = secp256k1_harbor_mul_r0(value);
+        vst1q_u64(outputs, product.lo);
+        vst1q_u64(outputs + 2, product.hi);
+        for (lane = 0; lane < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++lane) {
+            CHECK(outputs[lane] == inputs[lane] * 0x3d10ULL);
+        }
+        product = secp256k1_harbor_mul_977(value);
+        vst1q_u64(outputs, product.lo);
+        vst1q_u64(outputs + 2, product.hi);
+        for (lane = 0; lane < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++lane) {
+            CHECK(outputs[lane] == inputs[lane] * 977ULL);
+        }
+    }
+    int iteration;
+    for (iteration = 0; iteration < COUNT * 8; ++iteration) {
+        secp256k1_fe a[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH];
+        secp256k1_fe b[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH];
+        secp256k1_fe got[HARBOR_SECP256K1_BATCH_BACKEND_WIDTH];
+        secp256k1_fe expected;
+        secp256k1_harbor_fe4 av, bv, rv;
+        size_t lane;
+
+        for (lane = 0; lane < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++lane) {
+            testutil_random_fe(&a[lane]);
+            testutil_random_fe(&b[lane]);
+        }
+        secp256k1_harbor_arm64_fe4_from_fe(&av, a);
+        secp256k1_harbor_arm64_fe4_from_fe(&bv, b);
+        secp256k1_harbor_arm64_fe4_mul(&rv, &av, &bv);
+        secp256k1_harbor_arm64_fe4_to_fe(got, &rv);
+        for (lane = 0; lane < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++lane) {
+            secp256k1_fe_mul(&expected, &a[lane], &b[lane]);
+            CHECK(fe_equal(&got[lane], &expected));
+        }
+
+        secp256k1_harbor_arm64_fe4_sqr(&rv, &av);
+        secp256k1_harbor_arm64_fe4_to_fe(got, &rv);
+        for (lane = 0; lane < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++lane) {
+            secp256k1_fe_sqr(&expected, &a[lane]);
+            CHECK(fe_equal(&got[lane], &expected));
+        }
+
+        for (lane = 0; lane < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++lane) {
+            secp256k1_fe_sqr(&a[lane], &a[lane]);
+        }
+        CHECK(secp256k1_harbor_batch_fe_sqrt(got, a));
+        for (lane = 0; lane < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++lane) {
+            secp256k1_fe_sqr(&expected, &got[lane]);
+            CHECK(fe_equal(&expected, &a[lane]));
+        }
+
+        for (lane = 0; lane < HARBOR_SECP256K1_BATCH_BACKEND_WIDTH; ++lane) {
+            random_fe_non_square(&a[lane]);
+        }
+        CHECK(!secp256k1_harbor_batch_fe_sqrt(got, a));
+    }
+}
+#endif
+
 /***** FIELD/SCALAR INVERSE TESTS *****/
 
 static const secp256k1_scalar scalar_minus_one = SECP256K1_SCALAR_CONST(
@@ -7954,6 +8024,9 @@ static const struct tf_test_entry tests_field[] = {
     CASE(fe_mul),
     CASE(sqr),
     CASE(sqrt),
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ARM64_NEON)
+    CASE(harbor_arm64_batch_field_backend),
+#endif
 };
 
 static const struct tf_test_entry tests_group[] = {

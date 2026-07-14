@@ -168,7 +168,7 @@ struct secp256k1_ecdsa_recoverable_batch_workspace_struct {
     size_t *pubkey_groups;
     size_t *pubkey_group_first;
     size_t pubkey_slot_capacity;
-#if defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
     unsigned char *recid_odds;
 #endif
     secp256k1_scratch *scratch;
@@ -215,7 +215,7 @@ secp256k1_ecdsa_recoverable_batch_workspace *secp256k1_ecdsa_recoverable_batch_w
     workspace->pubkey_slots = (size_t *)malloc(workspace->pubkey_slot_capacity * sizeof(*workspace->pubkey_slots));
     workspace->pubkey_groups = (size_t *)malloc(capacity * sizeof(*workspace->pubkey_groups));
     workspace->pubkey_group_first = (size_t *)malloc(capacity * sizeof(*workspace->pubkey_group_first));
-#if defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
     workspace->recid_odds = (unsigned char *)malloc(capacity * sizeof(*workspace->recid_odds));
 #endif
     scratch_size = 1024 * 1024 + capacity * 4096;
@@ -223,7 +223,7 @@ secp256k1_ecdsa_recoverable_batch_workspace *secp256k1_ecdsa_recoverable_batch_w
     if (workspace->scalars == NULL || workspace->points == NULL ||
         workspace->pubkey_slots == NULL || workspace->pubkey_groups == NULL ||
         workspace->pubkey_group_first == NULL || workspace->scratch == NULL
-#if defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
         || workspace->recid_odds == NULL
 #endif
         ) {
@@ -246,7 +246,7 @@ void secp256k1_ecdsa_recoverable_batch_workspace_destroy(
     free(workspace->pubkey_slots);
     free(workspace->pubkey_groups);
     free(workspace->pubkey_group_first);
-#if defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
     free(workspace->recid_odds);
 #endif
     free(workspace);
@@ -308,7 +308,7 @@ static size_t secp256k1_ecdsa_batch_group_pubkeys(
     return unique_count;
 }
 
-#if defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
 static int secp256k1_ecdsa_batch_prepare_r_points(
         const secp256k1_context *ctx,
         secp256k1_ecdsa_recoverable_batch_workspace *workspace,
@@ -335,10 +335,10 @@ static int secp256k1_ecdsa_batch_prepare_r_points(
     }
 
     i = 0;
-    while (count - i >= HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH) {
-        if (!secp256k1_ge_set_xo_var_interleaved(&workspace->points[i],
-                                                  &workspace->recid_odds[i])) return 0;
-        i += HARBOR_SECP256K1_ARM64_SQRT_BATCH_WIDTH;
+    while (count - i >= HARBOR_SECP256K1_BATCH_BACKEND_WIDTH) {
+        if (!secp256k1_ge_set_xo_var_batch_backend(&workspace->points[i],
+                                                    &workspace->recid_odds[i])) return 0;
+        i += HARBOR_SECP256K1_BATCH_BACKEND_WIDTH;
     }
     for (; i < count; ++i) {
         if (!secp256k1_ge_set_xo_var(&workspace->points[i], &workspace->points[i].x,
@@ -405,7 +405,7 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
                            transcript_hash, sizeof(transcript_hash));
 #endif
 
-#if defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
     if (!secp256k1_ecdsa_batch_prepare_r_points(ctx, workspace, signatures, count)) goto cleanup;
     if (!aggregate_pubkeys) {
         i = count;
@@ -418,12 +418,12 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
 
     for (i = 0; i < count; ++i) {
         secp256k1_scalar r, s, z, coefficient, term, q_term;
-#if !defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if !defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
         secp256k1_fe x;
 #endif
         secp256k1_sha256 coefficient_hash;
         unsigned char coefficient_bytes[32];
-#if !defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if !defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
         unsigned char r_bytes[32];
 #endif
         unsigned char index_bytes[8];
@@ -438,7 +438,7 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
             recid ^= 1;
         }
 
-#if !defined(HARBOR_SECP256K1_ARM64_INTERLEAVED_SQRT)
+#if !defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
         secp256k1_scalar_get_b32(r_bytes, &r);
         if (!secp256k1_fe_set_b32_limit(&x, r_bytes)) goto cleanup;
         if (recid & 2) {
