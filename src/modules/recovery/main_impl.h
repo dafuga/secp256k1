@@ -164,6 +164,10 @@ typedef struct {
 struct secp256k1_ecdsa_recoverable_batch_workspace_struct {
     secp256k1_scalar *scalars;
     secp256k1_ge *points;
+    size_t *pubkey_slots;
+    size_t *pubkey_groups;
+    size_t *pubkey_group_first;
+    size_t pubkey_slot_capacity;
     secp256k1_scratch *scratch;
     size_t capacity;
 #ifdef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
@@ -197,9 +201,22 @@ secp256k1_ecdsa_recoverable_batch_workspace *secp256k1_ecdsa_recoverable_batch_w
     workspace->capacity = capacity;
     workspace->scalars = (secp256k1_scalar *)malloc(2 * capacity * sizeof(*workspace->scalars));
     workspace->points = (secp256k1_ge *)malloc(2 * capacity * sizeof(*workspace->points));
+    workspace->pubkey_slot_capacity = 1;
+    while (workspace->pubkey_slot_capacity < 2 * capacity) {
+        if (workspace->pubkey_slot_capacity > SIZE_MAX / 2) {
+            secp256k1_ecdsa_recoverable_batch_workspace_destroy(ctx, workspace);
+            return NULL;
+        }
+        workspace->pubkey_slot_capacity *= 2;
+    }
+    workspace->pubkey_slots = (size_t *)malloc(workspace->pubkey_slot_capacity * sizeof(*workspace->pubkey_slots));
+    workspace->pubkey_groups = (size_t *)malloc(capacity * sizeof(*workspace->pubkey_groups));
+    workspace->pubkey_group_first = (size_t *)malloc(capacity * sizeof(*workspace->pubkey_group_first));
     scratch_size = 1024 * 1024 + capacity * 4096;
     workspace->scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
-    if (workspace->scalars == NULL || workspace->points == NULL || workspace->scratch == NULL) {
+    if (workspace->scalars == NULL || workspace->points == NULL ||
+        workspace->pubkey_slots == NULL || workspace->pubkey_groups == NULL ||
+        workspace->pubkey_group_first == NULL || workspace->scratch == NULL) {
         secp256k1_ecdsa_recoverable_batch_workspace_destroy(ctx, workspace);
         return NULL;
     }
@@ -216,7 +233,66 @@ void secp256k1_ecdsa_recoverable_batch_workspace_destroy(
     }
     free(workspace->scalars);
     free(workspace->points);
+    free(workspace->pubkey_slots);
+    free(workspace->pubkey_groups);
+    free(workspace->pubkey_group_first);
     free(workspace);
+}
+
+static uint64_t secp256k1_ecdsa_batch_pubkey_hash(const secp256k1_pubkey *pubkey) {
+    const unsigned char *bytes = (const unsigned char *)pubkey;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    size_t i;
+    for (i = 0; i < sizeof(*pubkey); ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    hash ^= hash >> 33;
+    hash *= UINT64_C(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    return hash;
+}
+
+/* Return the number of distinct public-key terms worth aggregating. An
+ * identity result means the caller should retain the original 2N equation.
+ * Probe length is bounded so adversarial keys cannot turn grouping into an
+ * unbounded admission cost. */
+static size_t secp256k1_ecdsa_batch_group_pubkeys(
+        secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+        const secp256k1_pubkey *pubkeys,
+        size_t count) {
+    const size_t mask = workspace->pubkey_slot_capacity - 1;
+    size_t unique_count = 0;
+    size_t i;
+
+    if (count < 256) return count;
+    memset(workspace->pubkey_slots, 0xff,
+           workspace->pubkey_slot_capacity * sizeof(*workspace->pubkey_slots));
+
+    for (i = 0; i < count; ++i) {
+        size_t slot = (size_t)secp256k1_ecdsa_batch_pubkey_hash(&pubkeys[i]) & mask;
+        size_t probes;
+        for (probes = 0; probes < 64; ++probes) {
+            const size_t first = workspace->pubkey_slots[slot];
+            if (first == SIZE_MAX) {
+                workspace->pubkey_slots[slot] = i;
+                workspace->pubkey_groups[i] = unique_count;
+                workspace->pubkey_group_first[unique_count] = i;
+                ++unique_count;
+                break;
+            }
+            if (memcmp(&pubkeys[first], &pubkeys[i], sizeof(pubkeys[i])) == 0) {
+                workspace->pubkey_groups[i] = workspace->pubkey_groups[first];
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        if (probes == 64) return count;
+    }
+
+    /* The hash pass is cheap, but compacting a nearly unique batch is not. */
+    if (unique_count * 8 > count * 7) return count;
+    return unique_count;
 }
 
 int secp256k1_ecdsa_recoverable_verify_batch_workspace(
@@ -239,6 +315,8 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
     secp256k1_sha256 coefficient_prefix;
 #endif
     unsigned char transcript_hash[32];
+    size_t grouped_pubkeys;
+    int aggregate_pubkeys;
     size_t i;
     int ok = 0;
 
@@ -252,6 +330,14 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
 
     batch.scalars = workspace->scalars;
     batch.points = workspace->points;
+
+    grouped_pubkeys = secp256k1_ecdsa_batch_group_pubkeys(workspace, pubkeys, count);
+    aggregate_pubkeys = grouped_pubkeys < count;
+    if (aggregate_pubkeys) {
+        for (i = 0; i < grouped_pubkeys; ++i) {
+            batch.scalars[count + i] = secp256k1_scalar_zero;
+        }
+    }
 
     secp256k1_sha256_initialize(&transcript);
     secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &transcript, domain, sizeof(domain) - 1);
@@ -267,7 +353,7 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
 #endif
 
     for (i = 0; i < count; ++i) {
-        secp256k1_scalar r, s, z, coefficient, term;
+        secp256k1_scalar r, s, z, coefficient, term, q_term;
         secp256k1_fe x;
         secp256k1_sha256 coefficient_hash;
         unsigned char coefficient_bytes[32];
@@ -290,8 +376,15 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
             if (secp256k1_fe_cmp_var(&x, &secp256k1_ecdsa_const_p_minus_order) >= 0) goto cleanup;
             secp256k1_fe_add(&x, &secp256k1_ecdsa_const_order_as_fe);
         }
-        if (!secp256k1_ge_set_xo_var(&batch.points[2 * i], &x, recid & 1)) goto cleanup;
-        if (!secp256k1_pubkey_load(ctx, &batch.points[2 * i + 1], &pubkeys[i])) goto cleanup;
+        if (aggregate_pubkeys) {
+            const size_t group = workspace->pubkey_groups[i];
+            if (!secp256k1_ge_set_xo_var(&batch.points[i], &x, recid & 1)) goto cleanup;
+            if (workspace->pubkey_group_first[group] == i &&
+                !secp256k1_pubkey_load(ctx, &batch.points[count + group], &pubkeys[i])) goto cleanup;
+        } else {
+            if (!secp256k1_ge_set_xo_var(&batch.points[2 * i], &x, recid & 1)) goto cleanup;
+            if (!secp256k1_pubkey_load(ctx, &batch.points[2 * i + 1], &pubkeys[i])) goto cleanup;
+        }
 
 #ifdef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
         if ((i & 1U) == 0) {
@@ -321,9 +414,18 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
         if (overflow || secp256k1_scalar_is_zero(&coefficient))
             secp256k1_scalar_set_int(&coefficient, 1);
 
-        secp256k1_scalar_mul(&batch.scalars[2 * i], &coefficient, &s);
-        secp256k1_scalar_mul(&batch.scalars[2 * i + 1], &coefficient, &r);
-        secp256k1_scalar_negate(&batch.scalars[2 * i + 1], &batch.scalars[2 * i + 1]);
+        if (aggregate_pubkeys) {
+            const size_t group = workspace->pubkey_groups[i];
+            secp256k1_scalar_mul(&batch.scalars[i], &coefficient, &s);
+            secp256k1_scalar_mul(&q_term, &coefficient, &r);
+            secp256k1_scalar_negate(&q_term, &q_term);
+            secp256k1_scalar_add(&batch.scalars[count + group],
+                                 &batch.scalars[count + group], &q_term);
+        } else {
+            secp256k1_scalar_mul(&batch.scalars[2 * i], &coefficient, &s);
+            secp256k1_scalar_mul(&batch.scalars[2 * i + 1], &coefficient, &r);
+            secp256k1_scalar_negate(&batch.scalars[2 * i + 1], &batch.scalars[2 * i + 1]);
+        }
         secp256k1_scalar_set_b32(&z, messages32 + i * 32, NULL);
         secp256k1_scalar_mul(&term, &coefficient, &z);
         secp256k1_scalar_add(&g_scalar, &g_scalar, &term);
@@ -331,7 +433,8 @@ int secp256k1_ecdsa_recoverable_verify_batch_workspace(
     secp256k1_scalar_negate(&g_scalar, &g_scalar);
 
     if (!secp256k1_ecmult_multi_var(&ctx->error_callback, workspace->scratch, &result, &g_scalar,
-                                    secp256k1_ecdsa_batch_callback, &batch, 2 * count)) goto cleanup;
+                                    secp256k1_ecdsa_batch_callback, &batch,
+                                    aggregate_pubkeys ? count + grouped_pubkeys : 2 * count)) goto cleanup;
     ok = secp256k1_gej_is_infinity(&result);
 
 cleanup:
