@@ -68,6 +68,25 @@ SECP256K1_API int secp256k1_ecdsa_recoverable_signature_serialize_compact(
     const secp256k1_ecdsa_recoverable_signature *sig
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
 
+/** Serialize the R x-coordinate and normalized recovery id needed for point recovery.
+ *
+ *  This avoids materializing a normal ECDSA signature when an accelerator only
+ *  needs the recovery point input. The returned recovery id is adjusted for
+ *  low-S normalization. Zero R or S scalars are rejected.
+ *
+ *  Returns: 1 when the signature has nonzero scalars, 0 otherwise.
+ *  Args: ctx:      pointer to a context object.
+ *  Out:  output32: pointer to a 32-byte array for the R scalar.
+ *        recid:    pointer to an integer for the normalized recovery id.
+ *  In:   sig:      pointer to an initialized recoverable signature.
+ */
+SECP256K1_API int secp256k1_ecdsa_recoverable_signature_serialize_recovery_x(
+    const secp256k1_context *ctx,
+    unsigned char *output32,
+    int *recid,
+    const secp256k1_ecdsa_recoverable_signature *sig
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4);
+
 /** Create a recoverable ECDSA signature.
  *
  *  Returns: 1: signature created
@@ -196,6 +215,33 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recoverable_verif
     const unsigned char *r_points64,
     size_t count
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6);
+
+/** Prepare the canonical multi-scalar multiplication terms for a batch.
+ *
+ *  This performs the same transcript construction, signature normalization,
+ *  public-key grouping, scalar preparation, and external R-point validation as
+ *  secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r_xy, but does
+ *  not execute the final multi-scalar multiplication. The first output term is
+ *  the generator term. Each following term is encoded as a 32-byte big-endian
+ *  scalar and a canonical 64-byte big-endian x||y affine point.
+ *
+ *  This low-level interface is intended for independently validated batch MSM
+ *  accelerators. `term_capacity` must be at least 2 * count + 1. On success,
+ *  `term_count` receives the number of populated terms.
+ */
+SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int secp256k1_ecdsa_recoverable_prepare_batch_msm_workspace_prepared_r_xy(
+    const secp256k1_context *ctx,
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+    const secp256k1_ecdsa_recoverable_signature *signatures,
+    const unsigned char *messages32,
+    const secp256k1_pubkey *pubkeys,
+    const unsigned char *r_points64,
+    unsigned char *scalars32,
+    unsigned char *points64,
+    size_t term_capacity,
+    size_t *term_count,
+    size_t count
+) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(3) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5) SECP256K1_ARG_NONNULL(6) SECP256K1_ARG_NONNULL(7) SECP256K1_ARG_NONNULL(8) SECP256K1_ARG_NONNULL(10);
 
 #ifdef __cplusplus
 }

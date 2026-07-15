@@ -64,7 +64,6 @@
 #ifndef HARBOR_SECP256K1_PIPPENGER_12_FROM_POINTS
 #define HARBOR_SECP256K1_PIPPENGER_12_FROM_POINTS 16051
 #endif
-
 #define ECMULT_MAX_POINTS_PER_BATCH 5000000
 
 /** Fill a table 'pre_a' with precomputed odd multiples of a.

@@ -159,7 +159,10 @@ static void test_ecdsa_recoverable_batch_prepared_r(void) {
     secp256k1_pubkey r_points[BATCH_COUNT];
     unsigned char messages[BATCH_COUNT][32];
     unsigned char r_points_xy[BATCH_COUNT * 64];
+    unsigned char msm_scalars[(2 * BATCH_COUNT + 1) * 32];
+    unsigned char msm_points[(2 * BATCH_COUNT + 1) * 64];
     secp256k1_ecdsa_recoverable_batch_workspace *workspace;
+    size_t msm_term_count = 0;
     size_t i;
 
     memset(messages, 0, sizeof(messages));
@@ -169,7 +172,9 @@ static void test_ecdsa_recoverable_batch_prepared_r(void) {
         secp256k1_ge r_point;
         unsigned char seckey[32] = { 0 };
         unsigned char r_bytes[32];
+        unsigned char serialized_r[32];
         int recid;
+        int serialized_recid;
 
         seckey[31] = (unsigned char)(i + 1);
         messages[i][0] = (unsigned char)(0x40 + i);
@@ -182,6 +187,10 @@ static void test_ecdsa_recoverable_batch_prepared_r(void) {
             CTX, &r, &s, &recid, &signatures[i]);
         if (secp256k1_scalar_is_high(&s)) recid ^= 1;
         secp256k1_scalar_get_b32(r_bytes, &r);
+        CHECK(secp256k1_ecdsa_recoverable_signature_serialize_recovery_x(
+            CTX, serialized_r, &serialized_recid, &signatures[i]) == 1);
+        CHECK(secp256k1_memcmp_var(serialized_r, r_bytes, sizeof(r_bytes)) == 0);
+        CHECK(serialized_recid == recid);
         CHECK(secp256k1_fe_set_b32_limit(&x, r_bytes) == 1);
         if (recid & 2) {
             CHECK(secp256k1_fe_cmp_var(&x, &secp256k1_ecdsa_const_p_minus_order) < 0);
@@ -197,12 +206,29 @@ static void test_ecdsa_recoverable_batch_prepared_r(void) {
 
     workspace = secp256k1_ecdsa_recoverable_batch_workspace_create(CTX, BATCH_COUNT);
     CHECK(workspace != NULL);
+    {
+        secp256k1_ecdsa_recoverable_signature zero_signature;
+        unsigned char serialized_r[32];
+        int recid;
+        memset(&zero_signature, 0, sizeof(zero_signature));
+        CHECK(secp256k1_ecdsa_recoverable_signature_serialize_recovery_x(
+            CTX, serialized_r, &recid, &zero_signature) == 0);
+    }
     CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace(
         CTX, workspace, signatures, messages[0], pubkeys, BATCH_COUNT) == 1);
     CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r(
         CTX, workspace, signatures, messages[0], pubkeys, r_points, BATCH_COUNT) == 1);
     CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r_xy(
         CTX, workspace, signatures, messages[0], pubkeys, r_points_xy, BATCH_COUNT) == 1);
+    CHECK(secp256k1_ecdsa_recoverable_prepare_batch_msm_workspace_prepared_r_xy(
+        CTX, workspace, signatures, messages[0], pubkeys, r_points_xy,
+        msm_scalars, msm_points, 2 * BATCH_COUNT + 1, &msm_term_count,
+        BATCH_COUNT) == 1);
+    CHECK(msm_term_count > BATCH_COUNT && msm_term_count <= 2 * BATCH_COUNT + 1);
+    CHECK(secp256k1_ecdsa_recoverable_prepare_batch_msm_workspace_prepared_r_xy(
+        CTX, workspace, signatures, messages[0], pubkeys, r_points_xy,
+        msm_scalars, msm_points, msm_term_count - 1, &msm_term_count,
+        BATCH_COUNT) == 0);
 
     {
         secp256k1_pubkey mismatched[BATCH_COUNT];
