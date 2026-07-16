@@ -151,6 +151,104 @@ static void secp256k1_harbor_xyzz_add_ge_signed(
     secp256k1_harbor_xyzz_add_ge_signed_noninfinity(r, a, b, negate_b);
 }
 
+#if defined(HARBOR_SECP256K1_XYZZ_INTERLEAVED_ADDS)
+/* Two distinct Pippenger buckets have independent field-operation chains.
+ * Keeping both chains in one function lets wide out-of-order ARM cores hide
+ * multiply latency without changing bucket order or formulas. */
+static void secp256k1_harbor_xyzz_add_ge_signed_pair_noninfinity(
+        secp256k1_harbor_xyzz *r0, const secp256k1_harbor_xyzz *a0,
+        const secp256k1_ge *b0, int negate_b0,
+        secp256k1_harbor_xyzz *r1, const secp256k1_harbor_xyzz *a1,
+        const secp256k1_ge *b1, int negate_b1) {
+    secp256k1_fe u10, u20, s10, s20, h0, i0, h20, h30, t0;
+    secp256k1_fe x0, y0, zz0, zzz0;
+    secp256k1_fe u11, u21, s11, s21, h1, i1, h21, h31, t1;
+    secp256k1_fe x1, y1, zz1, zzz1;
+
+    u10 = a0->x;
+    u11 = a1->x;
+    secp256k1_fe_mul(&u20, &b0->x, &a0->zz);
+    secp256k1_fe_mul(&u21, &b1->x, &a1->zz);
+    s10 = a0->y;
+    s11 = a1->y;
+    secp256k1_fe_mul(&s20, &b0->y, &a0->zzz);
+    secp256k1_fe_mul(&s21, &b1->y, &a1->zzz);
+    if (negate_b0) secp256k1_fe_negate(&s20, &s20, 1);
+    if (negate_b1) secp256k1_fe_negate(&s21, &s21, 1);
+    secp256k1_fe_negate(&h0, &u10, SECP256K1_GEJ_X_MAGNITUDE_MAX);
+    secp256k1_fe_negate(&h1, &u11, SECP256K1_GEJ_X_MAGNITUDE_MAX);
+    secp256k1_fe_add(&h0, &u20);
+    secp256k1_fe_add(&h1, &u21);
+    secp256k1_fe_negate(&i0, &s20, 1);
+    secp256k1_fe_negate(&i1, &s21, 1);
+    secp256k1_fe_add(&i0, &s10);
+    secp256k1_fe_add(&i1, &s11);
+    if (secp256k1_fe_normalizes_to_zero_var(&h0) ||
+        secp256k1_fe_normalizes_to_zero_var(&h1)) {
+        secp256k1_harbor_xyzz_add_ge_signed_noninfinity(r0, a0, b0, negate_b0);
+        secp256k1_harbor_xyzz_add_ge_signed_noninfinity(r1, a1, b1, negate_b1);
+        return;
+    }
+
+    secp256k1_fe_sqr(&h20, &h0);
+    secp256k1_fe_sqr(&h21, &h1);
+    secp256k1_fe_mul(&zz0, &a0->zz, &h20);
+    secp256k1_fe_mul(&zz1, &a1->zz, &h21);
+    secp256k1_fe_mul(&h30, &h20, &h0);
+    secp256k1_fe_mul(&h31, &h21, &h1);
+    secp256k1_fe_mul(&zzz0, &a0->zzz, &h30);
+    secp256k1_fe_mul(&zzz1, &a1->zzz, &h31);
+    secp256k1_fe_negate(&h20, &h20, 1);
+    secp256k1_fe_negate(&h21, &h21, 1);
+    secp256k1_fe_negate(&h30, &h30, 1);
+    secp256k1_fe_negate(&h31, &h31, 1);
+    secp256k1_fe_mul(&t0, &u10, &h20);
+    secp256k1_fe_mul(&t1, &u11, &h21);
+    secp256k1_fe_sqr(&x0, &i0);
+    secp256k1_fe_sqr(&x1, &i1);
+    secp256k1_fe_add(&x0, &h30);
+    secp256k1_fe_add(&x1, &h31);
+    secp256k1_fe_add(&x0, &t0);
+    secp256k1_fe_add(&x1, &t1);
+    secp256k1_fe_add(&x0, &t0);
+    secp256k1_fe_add(&x1, &t1);
+    secp256k1_fe_add(&t0, &x0);
+    secp256k1_fe_add(&t1, &x1);
+    secp256k1_fe_mul(&y0, &t0, &i0);
+    secp256k1_fe_mul(&y1, &t1, &i1);
+    secp256k1_fe_mul(&h30, &h30, &s10);
+    secp256k1_fe_mul(&h31, &h31, &s11);
+    secp256k1_fe_add(&y0, &h30);
+    secp256k1_fe_add(&y1, &h31);
+
+    r0->x = x0;
+    r0->y = y0;
+    r0->zz = zz0;
+    r0->zzz = zzz0;
+    r0->infinity = 0;
+    r1->x = x1;
+    r1->y = y1;
+    r1->zz = zz1;
+    r1->zzz = zzz1;
+    r1->infinity = 0;
+}
+
+static void secp256k1_harbor_xyzz_add_ge_signed_pair(
+        secp256k1_harbor_xyzz *r0, const secp256k1_harbor_xyzz *a0,
+        const secp256k1_ge *b0, int negate_b0,
+        secp256k1_harbor_xyzz *r1, const secp256k1_harbor_xyzz *a1,
+        const secp256k1_ge *b1, int negate_b1) {
+    if (a0->infinity || b0->infinity || a1->infinity || b1->infinity) {
+        secp256k1_harbor_xyzz_add_ge_signed(r0, a0, b0, negate_b0);
+        secp256k1_harbor_xyzz_add_ge_signed(r1, a1, b1, negate_b1);
+        return;
+    }
+    secp256k1_harbor_xyzz_add_ge_signed_pair_noninfinity(
+        r0, a0, b0, negate_b0, r1, a1, b1, negate_b1);
+}
+
+#endif
+
 static void secp256k1_harbor_xyzz_add(
         secp256k1_harbor_xyzz *r, const secp256k1_harbor_xyzz *a,
         const secp256k1_harbor_xyzz *b) {
@@ -240,6 +338,77 @@ static int secp256k1_harbor_ecmult_pippenger_wnaf(
         for (bucket = 0; bucket < bucket_count; ++bucket) {
             secp256k1_harbor_xyzz_set_infinity(&state->xyzz_buckets[bucket]);
         }
+#if defined(HARBOR_SECP256K1_XYZZ_INTERLEAVED_ADDS)
+        if (window != 0) {
+            np = 0;
+            while (np < no) {
+                size_t first_np;
+                size_t second_np;
+                size_t first_bucket;
+                size_t second_bucket;
+                int first_digit;
+                int second_digit;
+
+                do {
+                    first_np = np++;
+                    first_digit = state->wnaf_na[first_np * n_wnaf + window];
+                } while (first_digit == 0 && np < no);
+                if (first_digit == 0) break;
+                first_bucket = first_digit > 0
+                    ? (size_t)(first_digit - 1) / 2
+                    : (size_t)(-(first_digit + 1)) / 2;
+
+                do {
+                    if (np == no) {
+                        secp256k1_harbor_xyzz_add_ge_signed(
+                            &state->xyzz_buckets[first_bucket],
+                            &state->xyzz_buckets[first_bucket],
+                            &pt[state->ps[first_np].input_pos], first_digit < 0);
+                        first_digit = 0;
+                        break;
+                    }
+                    second_np = np++;
+                    second_digit = state->wnaf_na[second_np * n_wnaf + window];
+                } while (second_digit == 0);
+                if (first_digit == 0) break;
+                second_bucket = second_digit > 0
+                    ? (size_t)(second_digit - 1) / 2
+                    : (size_t)(-(second_digit + 1)) / 2;
+#if defined(HARBOR_SECP256K1_XYZZ_PREFETCH_DISTANCE) && HARBOR_SECP256K1_XYZZ_PREFETCH_DISTANCE > 0 && defined(__GNUC__)
+                if (np + HARBOR_SECP256K1_XYZZ_PREFETCH_DISTANCE < no) {
+                    const size_t prefetch_np = np + HARBOR_SECP256K1_XYZZ_PREFETCH_DISTANCE;
+                    const int prefetch_digit = state->wnaf_na[prefetch_np * n_wnaf + window];
+                    if (prefetch_digit != 0) {
+                        const size_t prefetch_bucket = prefetch_digit > 0
+                            ? (size_t)(prefetch_digit - 1) / 2
+                            : (size_t)(-(prefetch_digit + 1)) / 2;
+                        __builtin_prefetch(&state->xyzz_buckets[prefetch_bucket], 1, 3);
+                        __builtin_prefetch((const unsigned char *)&state->xyzz_buckets[prefetch_bucket] + 128,
+                                           1, 3);
+                    }
+                }
+#endif
+                if (first_bucket == second_bucket) {
+                    secp256k1_harbor_xyzz_add_ge_signed(
+                        &state->xyzz_buckets[first_bucket],
+                        &state->xyzz_buckets[first_bucket],
+                        &pt[state->ps[first_np].input_pos], first_digit < 0);
+                    secp256k1_harbor_xyzz_add_ge_signed(
+                        &state->xyzz_buckets[second_bucket],
+                        &state->xyzz_buckets[second_bucket],
+                        &pt[state->ps[second_np].input_pos], second_digit < 0);
+                } else {
+                    secp256k1_harbor_xyzz_add_ge_signed_pair(
+                        &state->xyzz_buckets[first_bucket],
+                        &state->xyzz_buckets[first_bucket],
+                        &pt[state->ps[first_np].input_pos], first_digit < 0,
+                        &state->xyzz_buckets[second_bucket],
+                        &state->xyzz_buckets[second_bucket],
+                        &pt[state->ps[second_np].input_pos], second_digit < 0);
+                }
+            }
+        } else
+#endif
         for (np = 0; np < no; ++np) {
             const struct secp256k1_pippenger_point_state point_state = state->ps[np];
             const int digit = state->wnaf_na[np * n_wnaf + window];
