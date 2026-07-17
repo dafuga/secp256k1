@@ -204,14 +204,23 @@ static int secp256k1_ecdsa_batch_callback(secp256k1_scalar *scalar, secp256k1_ge
 secp256k1_ecdsa_recoverable_batch_workspace *secp256k1_ecdsa_recoverable_batch_workspace_create(
         const secp256k1_context *ctx, size_t capacity) {
     secp256k1_ecdsa_recoverable_batch_workspace *workspace = NULL;
+    const size_t max_msm_points = 2 * capacity;
+    int bucket_window;
     size_t scratch_size;
 
     VERIFY_CHECK(ctx != NULL);
     if (capacity == 0 || capacity > SIZE_MAX / (2 * sizeof(*workspace->scalars)) ||
         capacity > SIZE_MAX / (2 * sizeof(*workspace->points)) ||
-        capacity > (SIZE_MAX - 1024 * 1024) / 4096) {
+        capacity > SIZE_MAX / 2) {
         return NULL;
     }
+
+    bucket_window = secp256k1_pippenger_bucket_window(max_msm_points);
+    scratch_size = secp256k1_pippenger_scratch_size(max_msm_points, bucket_window);
+    if (scratch_size > SIZE_MAX - 1024 * 1024) return NULL;
+    /* The exact Pippenger allocation plus one MiB covers scratch-object
+     * alignment while avoiding the old 4096-byte-per-signature overreserve. */
+    scratch_size += 1024 * 1024;
 
     workspace = (secp256k1_ecdsa_recoverable_batch_workspace *)malloc(sizeof(*workspace));
     if (workspace == NULL) return NULL;
@@ -233,7 +242,6 @@ secp256k1_ecdsa_recoverable_batch_workspace *secp256k1_ecdsa_recoverable_batch_w
 #if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
     workspace->recid_odds = (unsigned char *)malloc(capacity * sizeof(*workspace->recid_odds));
 #endif
-    scratch_size = 1024 * 1024 + capacity * 4096;
     workspace->scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
     if (workspace->scalars == NULL || workspace->points == NULL ||
         workspace->pubkey_slots == NULL || workspace->pubkey_groups == NULL ||
