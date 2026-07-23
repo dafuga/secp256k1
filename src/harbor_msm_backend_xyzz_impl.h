@@ -247,6 +247,57 @@ static void secp256k1_harbor_xyzz_add_ge_signed_pair(
         r0, a0, b0, negate_b0, r1, a1, b1, negate_b1);
 }
 
+typedef struct {
+    size_t bucket;
+    size_t input_pos;
+    int negate;
+    int valid;
+} secp256k1_harbor_xyzz_pending_add;
+
+static SECP256K1_INLINE __attribute__((always_inline))
+void secp256k1_harbor_xyzz_queue_add(
+        struct secp256k1_pippenger_state *state, const secp256k1_ge *pt,
+        secp256k1_harbor_xyzz_pending_add *pending, size_t bucket,
+        size_t input_pos, int negate) {
+    if (!pending->valid) {
+        pending->bucket = bucket;
+        pending->input_pos = input_pos;
+        pending->negate = negate;
+        pending->valid = 1;
+        return;
+    }
+
+    if (pending->bucket == bucket) {
+        secp256k1_harbor_xyzz_add_ge_signed(
+            &state->xyzz_buckets[pending->bucket],
+            &state->xyzz_buckets[pending->bucket],
+            &pt[pending->input_pos], pending->negate);
+        secp256k1_harbor_xyzz_add_ge_signed(
+            &state->xyzz_buckets[bucket], &state->xyzz_buckets[bucket],
+            &pt[input_pos], negate);
+    } else {
+        secp256k1_harbor_xyzz_add_ge_signed_pair(
+            &state->xyzz_buckets[pending->bucket],
+            &state->xyzz_buckets[pending->bucket],
+            &pt[pending->input_pos], pending->negate,
+            &state->xyzz_buckets[bucket], &state->xyzz_buckets[bucket],
+            &pt[input_pos], negate);
+    }
+    pending->valid = 0;
+}
+
+static SECP256K1_INLINE __attribute__((always_inline))
+void secp256k1_harbor_xyzz_flush_add(
+        struct secp256k1_pippenger_state *state, const secp256k1_ge *pt,
+        secp256k1_harbor_xyzz_pending_add *pending) {
+    if (!pending->valid) return;
+    secp256k1_harbor_xyzz_add_ge_signed(
+        &state->xyzz_buckets[pending->bucket],
+        &state->xyzz_buckets[pending->bucket],
+        &pt[pending->input_pos], pending->negate);
+    pending->valid = 0;
+}
+
 #endif
 
 static void secp256k1_harbor_xyzz_add(
@@ -407,8 +458,42 @@ static int secp256k1_harbor_ecmult_pippenger_wnaf(
                         &pt[state->ps[second_np].input_pos], second_digit < 0);
                 }
             }
-        } else
+        } else {
+            secp256k1_harbor_xyzz_pending_add pending = {0, 0, 0, 0};
+
+            for (np = 0; np < no; ++np) {
+                const struct secp256k1_pippenger_point_state point_state = state->ps[np];
+                const int digit = state->wnaf_na[np * n_wnaf];
+#if defined(HARBOR_SECP256K1_XYZZ_PREFETCH_DISTANCE) && HARBOR_SECP256K1_XYZZ_PREFETCH_DISTANCE > 0 && defined(__GNUC__)
+                if (np + HARBOR_SECP256K1_XYZZ_PREFETCH_DISTANCE < no) {
+                    const size_t prefetch_np = np + HARBOR_SECP256K1_XYZZ_PREFETCH_DISTANCE;
+                    const int prefetch_digit = state->wnaf_na[prefetch_np * n_wnaf];
+                    if (prefetch_digit != 0) {
+                        const size_t prefetch_bucket = prefetch_digit > 0
+                            ? (size_t)(prefetch_digit - 1) / 2
+                            : (size_t)(-(prefetch_digit + 1)) / 2;
+                        __builtin_prefetch(&state->xyzz_buckets[prefetch_bucket], 1, 3);
+                        __builtin_prefetch((const unsigned char *)&state->xyzz_buckets[prefetch_bucket] + 128,
+                                           1, 3);
+                    }
+                }
 #endif
+                if (point_state.skew_na) {
+                    secp256k1_harbor_xyzz_queue_add(
+                        state, pt, &pending, 0, point_state.input_pos, 1);
+                }
+                if (digit != 0) {
+                    bucket = digit > 0
+                        ? (size_t)(digit - 1) / 2
+                        : (size_t)(-(digit + 1)) / 2;
+                    secp256k1_harbor_xyzz_queue_add(
+                        state, pt, &pending, bucket, point_state.input_pos,
+                        digit < 0);
+                }
+            }
+            secp256k1_harbor_xyzz_flush_add(state, pt, &pending);
+        }
+#else
         for (np = 0; np < no; ++np) {
             const struct secp256k1_pippenger_point_state point_state = state->ps[np];
             const int digit = state->wnaf_na[np * n_wnaf + window];
@@ -441,6 +526,7 @@ static int secp256k1_harbor_ecmult_pippenger_wnaf(
                 &state->xyzz_buckets[bucket], &state->xyzz_buckets[bucket],
                 &pt[point_state.input_pos], digit < 0);
         }
+#endif
 
         for (j = 0; j < bucket_window; ++j) {
             secp256k1_harbor_xyzz_double(&result, &result);
