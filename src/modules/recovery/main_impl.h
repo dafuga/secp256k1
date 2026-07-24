@@ -71,6 +71,21 @@ int secp256k1_ecdsa_recoverable_signature_serialize_compact(const secp256k1_cont
     return 1;
 }
 
+int secp256k1_ecdsa_recoverable_signature_serialize_recovery_x(const secp256k1_context* ctx, unsigned char *output32, int *recid, const secp256k1_ecdsa_recoverable_signature* sig) {
+    secp256k1_scalar r, s;
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(output32 != NULL);
+    ARG_CHECK(recid != NULL);
+    ARG_CHECK(sig != NULL);
+
+    secp256k1_ecdsa_recoverable_signature_load(ctx, &r, &s, recid, sig);
+    if (secp256k1_scalar_is_zero(&r) || secp256k1_scalar_is_zero(&s)) return 0;
+    if (secp256k1_scalar_is_high(&s)) *recid ^= 1;
+    secp256k1_scalar_get_b32(output32, &r);
+    return 1;
+}
+
 int secp256k1_ecdsa_recoverable_signature_convert(const secp256k1_context* ctx, secp256k1_ecdsa_signature* sig, const secp256k1_ecdsa_recoverable_signature* sigin) {
     secp256k1_scalar r, s;
     int recid;
@@ -154,6 +169,591 @@ int secp256k1_ecdsa_recover(const secp256k1_context* ctx, secp256k1_pubkey *pubk
         memset(pubkey, 0, sizeof(*pubkey));
         return 0;
     }
+}
+
+typedef struct {
+    secp256k1_scalar *scalars;
+    secp256k1_ge *points;
+} secp256k1_ecdsa_batch_data;
+
+struct secp256k1_ecdsa_recoverable_batch_workspace_struct {
+    secp256k1_scalar *scalars;
+    secp256k1_ge *points;
+    size_t *pubkey_slots;
+    size_t *pubkey_groups;
+    size_t *pubkey_group_first;
+    size_t pubkey_slot_capacity;
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
+    unsigned char *recid_odds;
+#endif
+    secp256k1_scratch *scratch;
+    size_t capacity;
+#ifdef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+    unsigned char coefficient_pair[32];
+#endif
+};
+
+static int secp256k1_ecdsa_batch_callback(secp256k1_scalar *scalar, secp256k1_ge *point,
+                                           size_t idx, void *data) {
+    secp256k1_ecdsa_batch_data *batch = (secp256k1_ecdsa_batch_data *)data;
+    *scalar = batch->scalars[idx];
+    *point = batch->points[idx];
+    return 1;
+}
+
+secp256k1_ecdsa_recoverable_batch_workspace *secp256k1_ecdsa_recoverable_batch_workspace_create(
+        const secp256k1_context *ctx, size_t capacity) {
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace = NULL;
+    const size_t max_msm_points = 2 * capacity;
+    int bucket_window;
+    size_t scratch_size;
+
+    VERIFY_CHECK(ctx != NULL);
+    if (capacity == 0 || capacity > SIZE_MAX / (2 * sizeof(*workspace->scalars)) ||
+        capacity > SIZE_MAX / (2 * sizeof(*workspace->points)) ||
+        capacity > SIZE_MAX / 2) {
+        return NULL;
+    }
+
+    bucket_window = secp256k1_pippenger_bucket_window(max_msm_points);
+    scratch_size = secp256k1_pippenger_scratch_size(max_msm_points, bucket_window);
+    if (scratch_size > SIZE_MAX - 1024 * 1024) return NULL;
+    /* The exact Pippenger allocation plus one MiB covers scratch-object
+     * alignment while avoiding the old 4096-byte-per-signature overreserve. */
+    scratch_size += 1024 * 1024;
+
+    workspace = (secp256k1_ecdsa_recoverable_batch_workspace *)malloc(sizeof(*workspace));
+    if (workspace == NULL) return NULL;
+    memset(workspace, 0, sizeof(*workspace));
+    workspace->capacity = capacity;
+    workspace->scalars = (secp256k1_scalar *)malloc(2 * capacity * sizeof(*workspace->scalars));
+    workspace->points = (secp256k1_ge *)malloc(2 * capacity * sizeof(*workspace->points));
+    workspace->pubkey_slot_capacity = 1;
+    while (workspace->pubkey_slot_capacity < 2 * capacity) {
+        if (workspace->pubkey_slot_capacity > SIZE_MAX / 2) {
+            secp256k1_ecdsa_recoverable_batch_workspace_destroy(ctx, workspace);
+            return NULL;
+        }
+        workspace->pubkey_slot_capacity *= 2;
+    }
+    workspace->pubkey_slots = (size_t *)malloc(workspace->pubkey_slot_capacity * sizeof(*workspace->pubkey_slots));
+    workspace->pubkey_groups = (size_t *)malloc(capacity * sizeof(*workspace->pubkey_groups));
+    workspace->pubkey_group_first = (size_t *)malloc(capacity * sizeof(*workspace->pubkey_group_first));
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
+    workspace->recid_odds = (unsigned char *)malloc(capacity * sizeof(*workspace->recid_odds));
+#endif
+    workspace->scratch = secp256k1_scratch_create(&ctx->error_callback, scratch_size);
+    if (workspace->scalars == NULL || workspace->points == NULL ||
+        workspace->pubkey_slots == NULL || workspace->pubkey_groups == NULL ||
+        workspace->pubkey_group_first == NULL || workspace->scratch == NULL
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
+        || workspace->recid_odds == NULL
+#endif
+        ) {
+        secp256k1_ecdsa_recoverable_batch_workspace_destroy(ctx, workspace);
+        return NULL;
+    }
+    return workspace;
+}
+
+void secp256k1_ecdsa_recoverable_batch_workspace_destroy(
+        const secp256k1_context *ctx,
+        secp256k1_ecdsa_recoverable_batch_workspace *workspace) {
+    VERIFY_CHECK(ctx != NULL);
+    if (workspace == NULL) return;
+    if (workspace->scratch != NULL) {
+        secp256k1_scratch_destroy(&ctx->error_callback, workspace->scratch);
+    }
+    free(workspace->scalars);
+    free(workspace->points);
+    free(workspace->pubkey_slots);
+    free(workspace->pubkey_groups);
+    free(workspace->pubkey_group_first);
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
+    free(workspace->recid_odds);
+#endif
+    free(workspace);
+}
+
+static uint64_t secp256k1_ecdsa_batch_pubkey_hash(const secp256k1_pubkey *pubkey) {
+    const unsigned char *bytes = (const unsigned char *)pubkey;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    size_t i;
+    for (i = 0; i < sizeof(*pubkey); ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    hash ^= hash >> 33;
+    hash *= UINT64_C(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    return hash;
+}
+
+/* Return the number of distinct public-key terms worth aggregating. An
+ * identity result means the caller should retain the original 2N equation.
+ * Probe length is bounded so adversarial keys cannot turn grouping into an
+ * unbounded admission cost. */
+static size_t secp256k1_ecdsa_batch_group_pubkeys(
+        secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+        const secp256k1_pubkey *pubkeys,
+        size_t count) {
+    const size_t mask = workspace->pubkey_slot_capacity - 1;
+    size_t unique_count = 0;
+    size_t i;
+
+    if (count < 256) return count;
+    memset(workspace->pubkey_slots, 0xff,
+           workspace->pubkey_slot_capacity * sizeof(*workspace->pubkey_slots));
+
+    for (i = 0; i < count; ++i) {
+        size_t slot = (size_t)secp256k1_ecdsa_batch_pubkey_hash(&pubkeys[i]) & mask;
+        size_t probes;
+        for (probes = 0; probes < 64; ++probes) {
+            const size_t first = workspace->pubkey_slots[slot];
+            if (first == SIZE_MAX) {
+                workspace->pubkey_slots[slot] = i;
+                workspace->pubkey_groups[i] = unique_count;
+                workspace->pubkey_group_first[unique_count] = i;
+                ++unique_count;
+                break;
+            }
+            if (memcmp(&pubkeys[first], &pubkeys[i], sizeof(pubkeys[i])) == 0) {
+                workspace->pubkey_groups[i] = workspace->pubkey_groups[first];
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+        if (probes == 64) return count;
+    }
+
+    /* The hash pass is cheap, but compacting a nearly unique batch is not. */
+    if (unique_count * 8 > count * 7) return count;
+    return unique_count;
+}
+
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
+static int secp256k1_ecdsa_batch_prepare_r_points(
+        const secp256k1_context *ctx,
+        secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+        const secp256k1_ecdsa_recoverable_signature *signatures,
+        size_t count) {
+    size_t i;
+
+    for (i = 0; i < count; ++i) {
+        secp256k1_scalar r, s;
+        unsigned char r_bytes[32];
+        int recid;
+
+        secp256k1_ecdsa_recoverable_signature_load(ctx, &r, &s, &recid, &signatures[i]);
+        if (secp256k1_scalar_is_zero(&r) || secp256k1_scalar_is_zero(&s)) return 0;
+        if (secp256k1_scalar_is_high(&s)) recid ^= 1;
+        secp256k1_scalar_get_b32(r_bytes, &r);
+        if (!secp256k1_fe_set_b32_limit(&workspace->points[i].x, r_bytes)) return 0;
+        if (recid & 2) {
+            if (secp256k1_fe_cmp_var(&workspace->points[i].x,
+                                     &secp256k1_ecdsa_const_p_minus_order) >= 0) return 0;
+            secp256k1_fe_add(&workspace->points[i].x, &secp256k1_ecdsa_const_order_as_fe);
+        }
+        workspace->recid_odds[i] = (unsigned char)(recid & 1);
+    }
+
+    i = 0;
+    while (count - i >= HARBOR_SECP256K1_BATCH_BACKEND_WIDTH) {
+        if (!secp256k1_ge_set_xo_var_batch_backend(&workspace->points[i],
+                                                    &workspace->recid_odds[i])) return 0;
+        i += HARBOR_SECP256K1_BATCH_BACKEND_WIDTH;
+    }
+    for (; i < count; ++i) {
+        if (!secp256k1_ge_set_xo_var(&workspace->points[i], &workspace->points[i].x,
+                                      workspace->recid_odds[i])) return 0;
+    }
+    return 1;
+}
+#endif
+
+static int secp256k1_ecdsa_batch_prepare_external_r_points(
+        const secp256k1_context *ctx,
+        secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+        const secp256k1_ecdsa_recoverable_signature *signatures,
+        const secp256k1_pubkey *r_points,
+        size_t count) {
+    size_t i;
+
+    for (i = 0; i < count; ++i) {
+        secp256k1_scalar r, s;
+        secp256k1_fe expected_x;
+        secp256k1_ge supplied;
+        unsigned char r_bytes[32];
+        int recid;
+
+        secp256k1_ecdsa_recoverable_signature_load(ctx, &r, &s, &recid, &signatures[i]);
+        if (secp256k1_scalar_is_zero(&r) || secp256k1_scalar_is_zero(&s)) return 0;
+        if (secp256k1_scalar_is_high(&s)) recid ^= 1;
+        secp256k1_scalar_get_b32(r_bytes, &r);
+        if (!secp256k1_fe_set_b32_limit(&expected_x, r_bytes)) return 0;
+        if (recid & 2) {
+            if (secp256k1_fe_cmp_var(&expected_x,
+                                     &secp256k1_ecdsa_const_p_minus_order) >= 0) return 0;
+            secp256k1_fe_add(&expected_x, &secp256k1_ecdsa_const_order_as_fe);
+        }
+        if (!secp256k1_pubkey_load(ctx, &supplied, &r_points[i])) return 0;
+        secp256k1_fe_normalize_var(&supplied.x);
+        secp256k1_fe_normalize_var(&supplied.y);
+        if (!secp256k1_fe_equal(&supplied.x, &expected_x) ||
+            secp256k1_fe_is_odd(&supplied.y) != (recid & 1)) return 0;
+        workspace->points[i] = supplied;
+    }
+    return 1;
+}
+
+static int secp256k1_ecdsa_batch_prepare_external_r_xy(
+        const secp256k1_context *ctx,
+        secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+        const secp256k1_ecdsa_recoverable_signature *signatures,
+        const unsigned char *r_points64,
+        size_t count) {
+    size_t i;
+
+    for (i = 0; i < count; ++i) {
+        secp256k1_scalar r, s;
+        secp256k1_fe expected_x;
+        secp256k1_ge supplied;
+        unsigned char r_bytes[32];
+        int recid;
+
+        secp256k1_ecdsa_recoverable_signature_load(ctx, &r, &s, &recid, &signatures[i]);
+        if (secp256k1_scalar_is_zero(&r) || secp256k1_scalar_is_zero(&s)) return 0;
+        if (secp256k1_scalar_is_high(&s)) recid ^= 1;
+        secp256k1_scalar_get_b32(r_bytes, &r);
+        if (!secp256k1_fe_set_b32_limit(&expected_x, r_bytes)) return 0;
+        if (recid & 2) {
+            if (secp256k1_fe_cmp_var(&expected_x,
+                                     &secp256k1_ecdsa_const_p_minus_order) >= 0) return 0;
+            secp256k1_fe_add(&expected_x, &secp256k1_ecdsa_const_order_as_fe);
+        }
+        if (!secp256k1_fe_set_b32_limit(&supplied.x, r_points64 + 64 * i) ||
+            !secp256k1_fe_set_b32_limit(&supplied.y, r_points64 + 64 * i + 32)) return 0;
+        supplied.infinity = 0;
+        if (!secp256k1_fe_equal(&supplied.x, &expected_x) ||
+            secp256k1_fe_is_odd(&supplied.y) != (recid & 1) ||
+            !secp256k1_ge_is_valid_var(&supplied)) return 0;
+        workspace->points[i] = supplied;
+    }
+    return 1;
+}
+
+static void secp256k1_ecdsa_batch_serialize_ge_xy(
+        unsigned char *output64,
+        const secp256k1_ge *point) {
+    secp256k1_fe x = point->x;
+    secp256k1_fe y = point->y;
+    secp256k1_fe_normalize_var(&x);
+    secp256k1_fe_normalize_var(&y);
+    secp256k1_fe_get_b32(output64, &x);
+    secp256k1_fe_get_b32(output64 + 32, &y);
+}
+
+static int secp256k1_ecdsa_recoverable_verify_batch_workspace_impl(
+                                              const secp256k1_context *ctx,
+                                              secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+                                              const secp256k1_ecdsa_recoverable_signature *signatures,
+                                              const unsigned char *messages32,
+                                              const secp256k1_pubkey *pubkeys,
+                                              const secp256k1_pubkey *prepared_r_points,
+                                              const unsigned char *prepared_r_xy,
+                                              unsigned char *prepared_scalars32,
+                                              unsigned char *prepared_points64,
+                                              size_t prepared_term_capacity,
+                                              size_t *prepared_term_count,
+                                              int prepare_only,
+                                              size_t count) {
+#ifdef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+    static const unsigned char domain[] = "Harbor/K1BatchVerify/128/v1";
+#else
+    static const unsigned char domain[] = "Harbor/K1BatchVerify/v1";
+#endif
+    secp256k1_ecdsa_batch_data batch;
+    secp256k1_scalar g_scalar = secp256k1_scalar_zero;
+    secp256k1_gej result;
+    secp256k1_sha256 transcript;
+#ifndef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+    secp256k1_sha256 coefficient_prefix;
+#endif
+    unsigned char transcript_hash[32];
+    size_t grouped_pubkeys;
+    int aggregate_pubkeys;
+    int r_points_prepared = 0;
+    size_t i;
+    int ok = 0;
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(workspace != NULL);
+    ARG_CHECK(signatures != NULL);
+    ARG_CHECK(messages32 != NULL);
+    ARG_CHECK(pubkeys != NULL);
+    if (prepare_only) {
+        ARG_CHECK(prepared_scalars32 != NULL);
+        ARG_CHECK(prepared_points64 != NULL);
+        ARG_CHECK(prepared_term_count != NULL);
+    }
+    if (count == 0) return 1;
+    if (count > workspace->capacity) return 0;
+
+    batch.scalars = workspace->scalars;
+    batch.points = workspace->points;
+
+    grouped_pubkeys = secp256k1_ecdsa_batch_group_pubkeys(workspace, pubkeys, count);
+    aggregate_pubkeys = grouped_pubkeys < count;
+    if (aggregate_pubkeys) {
+        for (i = 0; i < grouped_pubkeys; ++i) {
+            batch.scalars[count + i] = secp256k1_scalar_zero;
+        }
+    }
+
+    secp256k1_sha256_initialize(&transcript);
+    secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &transcript, domain, sizeof(domain) - 1);
+    secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &transcript, (const unsigned char *)signatures, count * sizeof(*signatures));
+    secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &transcript, messages32, count * 32);
+    secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &transcript, (const unsigned char *)pubkeys, count * sizeof(*pubkeys));
+    secp256k1_sha256_finalize(secp256k1_get_hash_context(ctx), &transcript, transcript_hash);
+
+#ifndef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+    secp256k1_sha256_initialize(&coefficient_prefix);
+    secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_prefix,
+                           transcript_hash, sizeof(transcript_hash));
+#endif
+
+    if (prepared_r_points != NULL) {
+        if (!secp256k1_ecdsa_batch_prepare_external_r_points(
+                ctx, workspace, signatures, prepared_r_points, count)) goto cleanup;
+        r_points_prepared = 1;
+    }
+    else if (prepared_r_xy != NULL) {
+        if (!secp256k1_ecdsa_batch_prepare_external_r_xy(
+                ctx, workspace, signatures, prepared_r_xy, count)) goto cleanup;
+        r_points_prepared = 1;
+    }
+#if defined(HARBOR_SECP256K1_BATCH_BACKEND_ENABLED)
+    else {
+        if (!secp256k1_ecdsa_batch_prepare_r_points(ctx, workspace, signatures, count)) goto cleanup;
+        r_points_prepared = 1;
+    }
+#endif
+    if (r_points_prepared && !aggregate_pubkeys) {
+        i = count;
+        while (i > 0) {
+            --i;
+            batch.points[2 * i] = batch.points[i];
+        }
+    }
+
+    for (i = 0; i < count; ++i) {
+        secp256k1_scalar r, s, z, coefficient, term, q_term;
+        secp256k1_fe x;
+        secp256k1_sha256 coefficient_hash;
+        unsigned char coefficient_bytes[32];
+        unsigned char r_bytes[32];
+        unsigned char index_bytes[8];
+        int recid;
+        int overflow;
+        size_t j;
+
+        secp256k1_ecdsa_recoverable_signature_load(ctx, &r, &s, &recid, &signatures[i]);
+        if (secp256k1_scalar_is_zero(&r) || secp256k1_scalar_is_zero(&s)) goto cleanup;
+        if (secp256k1_scalar_is_high(&s)) {
+            secp256k1_scalar_negate(&s, &s);
+            recid ^= 1;
+        }
+
+        if (!r_points_prepared) {
+            secp256k1_scalar_get_b32(r_bytes, &r);
+            if (!secp256k1_fe_set_b32_limit(&x, r_bytes)) goto cleanup;
+            if (recid & 2) {
+                if (secp256k1_fe_cmp_var(&x, &secp256k1_ecdsa_const_p_minus_order) >= 0) goto cleanup;
+                secp256k1_fe_add(&x, &secp256k1_ecdsa_const_order_as_fe);
+            }
+            if (aggregate_pubkeys) {
+                if (!secp256k1_ge_set_xo_var(&batch.points[i], &x, recid & 1)) goto cleanup;
+            } else if (!secp256k1_ge_set_xo_var(&batch.points[2 * i], &x, recid & 1)) {
+                goto cleanup;
+            }
+        }
+        if (aggregate_pubkeys) {
+            const size_t group = workspace->pubkey_groups[i];
+            if (workspace->pubkey_group_first[group] == i &&
+                !secp256k1_pubkey_load(ctx, &batch.points[count + group], &pubkeys[i])) goto cleanup;
+        } else if (!secp256k1_pubkey_load(ctx, &batch.points[2 * i + 1], &pubkeys[i])) {
+            goto cleanup;
+        }
+
+#ifdef HARBOR_SECP256K1_BATCH_COEFFICIENTS_128
+        if ((i & 1U) == 0) {
+            const size_t coefficient_pair = i / 2;
+            for (j = 0; j < sizeof(index_bytes); ++j)
+                index_bytes[sizeof(index_bytes) - 1 - j] = (unsigned char)(coefficient_pair >> (8 * j));
+            secp256k1_sha256_initialize(&coefficient_hash);
+            secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                                   transcript_hash, sizeof(transcript_hash));
+            secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                                   index_bytes, sizeof(index_bytes));
+            secp256k1_sha256_finalize(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                                     workspace->coefficient_pair);
+        }
+        memset(coefficient_bytes, 0, 16);
+        memcpy(coefficient_bytes + 16, workspace->coefficient_pair + ((i & 1U) ? 16 : 0), 16);
+#else
+        for (j = 0; j < sizeof(index_bytes); ++j)
+            index_bytes[sizeof(index_bytes) - 1 - j] = (unsigned char)(i >> (8 * j));
+        coefficient_hash = coefficient_prefix;
+        secp256k1_sha256_write(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                               index_bytes, sizeof(index_bytes));
+        secp256k1_sha256_finalize(secp256k1_get_hash_context(ctx), &coefficient_hash,
+                                 coefficient_bytes);
+#endif
+        secp256k1_scalar_set_b32(&coefficient, coefficient_bytes, &overflow);
+        if (overflow || secp256k1_scalar_is_zero(&coefficient))
+            secp256k1_scalar_set_int(&coefficient, 1);
+
+        if (aggregate_pubkeys) {
+            const size_t group = workspace->pubkey_groups[i];
+            secp256k1_scalar_mul(&batch.scalars[i], &coefficient, &s);
+            secp256k1_scalar_mul(&q_term, &coefficient, &r);
+            secp256k1_scalar_negate(&q_term, &q_term);
+            secp256k1_scalar_add(&batch.scalars[count + group],
+                                 &batch.scalars[count + group], &q_term);
+        } else {
+            secp256k1_scalar_mul(&batch.scalars[2 * i], &coefficient, &s);
+            secp256k1_scalar_mul(&batch.scalars[2 * i + 1], &coefficient, &r);
+            secp256k1_scalar_negate(&batch.scalars[2 * i + 1], &batch.scalars[2 * i + 1]);
+        }
+        secp256k1_scalar_set_b32(&z, messages32 + i * 32, NULL);
+        secp256k1_scalar_mul(&term, &coefficient, &z);
+        secp256k1_scalar_add(&g_scalar, &g_scalar, &term);
+    }
+    secp256k1_scalar_negate(&g_scalar, &g_scalar);
+
+    if (prepare_only) {
+        const size_t point_terms = aggregate_pubkeys ? count + grouped_pubkeys : 2 * count;
+        const size_t total_terms = point_terms + 1;
+        if (prepared_term_capacity < total_terms) goto cleanup;
+
+        secp256k1_scalar_get_b32(prepared_scalars32, &g_scalar);
+        secp256k1_ecdsa_batch_serialize_ge_xy(prepared_points64, &secp256k1_ge_const_g);
+        for (i = 0; i < point_terms; ++i) {
+            secp256k1_scalar_get_b32(prepared_scalars32 + 32 * (i + 1), &batch.scalars[i]);
+            secp256k1_ecdsa_batch_serialize_ge_xy(
+                prepared_points64 + 64 * (i + 1), &batch.points[i]);
+        }
+        *prepared_term_count = total_terms;
+        ok = 1;
+        goto cleanup;
+    }
+
+    if (!secp256k1_ecmult_multi_var(&ctx->error_callback, workspace->scratch, &result, &g_scalar,
+                                    secp256k1_ecdsa_batch_callback, &batch,
+                                    aggregate_pubkeys ? count + grouped_pubkeys : 2 * count)) goto cleanup;
+    ok = secp256k1_gej_is_infinity(&result);
+
+cleanup:
+    return ok;
+}
+
+int secp256k1_ecdsa_recoverable_verify_batch_workspace(
+                                              const secp256k1_context *ctx,
+                                              secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+                                              const secp256k1_ecdsa_recoverable_signature *signatures,
+                                              const unsigned char *messages32,
+                                              const secp256k1_pubkey *pubkeys,
+                                              size_t count) {
+    return secp256k1_ecdsa_recoverable_verify_batch_workspace_impl(
+        ctx, workspace, signatures, messages32, pubkeys, NULL, NULL,
+        NULL, NULL, 0, NULL, 0, count);
+}
+
+int secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r(
+                                              const secp256k1_context *ctx,
+                                              secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+                                              const secp256k1_ecdsa_recoverable_signature *signatures,
+                                              const unsigned char *messages32,
+                                              const secp256k1_pubkey *pubkeys,
+                                              const secp256k1_pubkey *r_points,
+                                              size_t count) {
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(workspace != NULL);
+    ARG_CHECK(signatures != NULL);
+    ARG_CHECK(messages32 != NULL);
+    ARG_CHECK(pubkeys != NULL);
+    ARG_CHECK(r_points != NULL);
+    return secp256k1_ecdsa_recoverable_verify_batch_workspace_impl(
+        ctx, workspace, signatures, messages32, pubkeys, r_points, NULL,
+        NULL, NULL, 0, NULL, 0, count);
+}
+
+int secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r_xy(
+                                              const secp256k1_context *ctx,
+                                              secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+                                              const secp256k1_ecdsa_recoverable_signature *signatures,
+                                              const unsigned char *messages32,
+                                              const secp256k1_pubkey *pubkeys,
+                                              const unsigned char *r_points64,
+                                              size_t count) {
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(workspace != NULL);
+    ARG_CHECK(signatures != NULL);
+    ARG_CHECK(messages32 != NULL);
+    ARG_CHECK(pubkeys != NULL);
+    ARG_CHECK(r_points64 != NULL);
+    return secp256k1_ecdsa_recoverable_verify_batch_workspace_impl(
+        ctx, workspace, signatures, messages32, pubkeys, NULL, r_points64,
+        NULL, NULL, 0, NULL, 0, count);
+}
+
+int secp256k1_ecdsa_recoverable_prepare_batch_msm_workspace_prepared_r_xy(
+                                              const secp256k1_context *ctx,
+                                              secp256k1_ecdsa_recoverable_batch_workspace *workspace,
+                                              const secp256k1_ecdsa_recoverable_signature *signatures,
+                                              const unsigned char *messages32,
+                                              const secp256k1_pubkey *pubkeys,
+                                              const unsigned char *r_points64,
+                                              unsigned char *scalars32,
+                                              unsigned char *points64,
+                                              size_t term_capacity,
+                                              size_t *term_count,
+                                              size_t count) {
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(workspace != NULL);
+    ARG_CHECK(signatures != NULL);
+    ARG_CHECK(messages32 != NULL);
+    ARG_CHECK(pubkeys != NULL);
+    ARG_CHECK(r_points64 != NULL);
+    ARG_CHECK(scalars32 != NULL);
+    ARG_CHECK(points64 != NULL);
+    ARG_CHECK(term_count != NULL);
+    return secp256k1_ecdsa_recoverable_verify_batch_workspace_impl(
+        ctx, workspace, signatures, messages32, pubkeys, NULL, r_points64,
+        scalars32, points64, term_capacity, term_count, 1, count);
+}
+
+int secp256k1_ecdsa_recoverable_verify_batch(const secp256k1_context *ctx,
+                                              const secp256k1_ecdsa_recoverable_signature *signatures,
+                                              const unsigned char *messages32,
+                                              const secp256k1_pubkey *pubkeys,
+                                              size_t count) {
+    int ok;
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace;
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(signatures != NULL);
+    ARG_CHECK(messages32 != NULL);
+    ARG_CHECK(pubkeys != NULL);
+    if (count == 0) return 1;
+
+    workspace = secp256k1_ecdsa_recoverable_batch_workspace_create(ctx, count);
+    if (workspace == NULL) return 0;
+    ok = secp256k1_ecdsa_recoverable_verify_batch_workspace(
+        ctx, workspace, signatures, messages32, pubkeys, count);
+    secp256k1_ecdsa_recoverable_batch_workspace_destroy(ctx, workspace);
+    return ok;
 }
 
 #endif /* SECP256K1_MODULE_RECOVERY_MAIN_H */

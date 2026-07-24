@@ -152,6 +152,120 @@ static void test_ecdsa_recovery_end_to_end_internal(void) {
           secp256k1_memcmp_var(&pubkey, &recpubkey, sizeof(pubkey)) != 0);
 }
 
+static void test_ecdsa_recoverable_batch_prepared_r(void) {
+    enum { BATCH_COUNT = 8 };
+    secp256k1_ecdsa_recoverable_signature signatures[BATCH_COUNT];
+    secp256k1_pubkey pubkeys[BATCH_COUNT];
+    secp256k1_pubkey r_points[BATCH_COUNT];
+    unsigned char messages[BATCH_COUNT][32];
+    unsigned char r_points_xy[BATCH_COUNT * 64];
+    unsigned char msm_scalars[(2 * BATCH_COUNT + 1) * 32];
+    unsigned char msm_points[(2 * BATCH_COUNT + 1) * 64];
+    secp256k1_ecdsa_recoverable_batch_workspace *workspace;
+    size_t msm_term_count = 0;
+    size_t i;
+
+    memset(messages, 0, sizeof(messages));
+    for (i = 0; i < BATCH_COUNT; ++i) {
+        secp256k1_scalar r, s;
+        secp256k1_fe x;
+        secp256k1_ge r_point;
+        unsigned char seckey[32] = { 0 };
+        unsigned char r_bytes[32];
+        unsigned char serialized_r[32];
+        int recid;
+        int serialized_recid;
+
+        seckey[31] = (unsigned char)(i + 1);
+        messages[i][0] = (unsigned char)(0x40 + i);
+        messages[i][31] = (unsigned char)(0x90 + i);
+        CHECK(secp256k1_ec_pubkey_create(CTX, &pubkeys[i], seckey) == 1);
+        CHECK(secp256k1_ecdsa_sign_recoverable(
+            CTX, &signatures[i], messages[i], seckey, NULL, NULL) == 1);
+
+        secp256k1_ecdsa_recoverable_signature_load(
+            CTX, &r, &s, &recid, &signatures[i]);
+        if (secp256k1_scalar_is_high(&s)) recid ^= 1;
+        secp256k1_scalar_get_b32(r_bytes, &r);
+        CHECK(secp256k1_ecdsa_recoverable_signature_serialize_recovery_x(
+            CTX, serialized_r, &serialized_recid, &signatures[i]) == 1);
+        CHECK(secp256k1_memcmp_var(serialized_r, r_bytes, sizeof(r_bytes)) == 0);
+        CHECK(serialized_recid == recid);
+        CHECK(secp256k1_fe_set_b32_limit(&x, r_bytes) == 1);
+        if (recid & 2) {
+            CHECK(secp256k1_fe_cmp_var(&x, &secp256k1_ecdsa_const_p_minus_order) < 0);
+            secp256k1_fe_add(&x, &secp256k1_ecdsa_const_order_as_fe);
+        }
+        CHECK(secp256k1_ge_set_xo_var(&r_point, &x, recid & 1) == 1);
+        secp256k1_pubkey_save(&r_points[i], &r_point);
+        secp256k1_fe_normalize_var(&r_point.x);
+        secp256k1_fe_normalize_var(&r_point.y);
+        secp256k1_fe_get_b32(r_points_xy + 64 * i, &r_point.x);
+        secp256k1_fe_get_b32(r_points_xy + 64 * i + 32, &r_point.y);
+    }
+
+    workspace = secp256k1_ecdsa_recoverable_batch_workspace_create(CTX, BATCH_COUNT);
+    CHECK(workspace != NULL);
+    {
+        secp256k1_ecdsa_recoverable_signature zero_signature;
+        unsigned char serialized_r[32];
+        int recid;
+        memset(&zero_signature, 0, sizeof(zero_signature));
+        CHECK(secp256k1_ecdsa_recoverable_signature_serialize_recovery_x(
+            CTX, serialized_r, &recid, &zero_signature) == 0);
+    }
+    CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace(
+        CTX, workspace, signatures, messages[0], pubkeys, BATCH_COUNT) == 1);
+    CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r(
+        CTX, workspace, signatures, messages[0], pubkeys, r_points, BATCH_COUNT) == 1);
+    CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r_xy(
+        CTX, workspace, signatures, messages[0], pubkeys, r_points_xy, BATCH_COUNT) == 1);
+    CHECK(secp256k1_ecdsa_recoverable_prepare_batch_msm_workspace_prepared_r_xy(
+        CTX, workspace, signatures, messages[0], pubkeys, r_points_xy,
+        msm_scalars, msm_points, 2 * BATCH_COUNT + 1, &msm_term_count,
+        BATCH_COUNT) == 1);
+    CHECK(msm_term_count > BATCH_COUNT && msm_term_count <= 2 * BATCH_COUNT + 1);
+    CHECK(secp256k1_ecdsa_recoverable_prepare_batch_msm_workspace_prepared_r_xy(
+        CTX, workspace, signatures, messages[0], pubkeys, r_points_xy,
+        msm_scalars, msm_points, msm_term_count - 1, &msm_term_count,
+        BATCH_COUNT) == 0);
+
+    {
+        secp256k1_pubkey mismatched[BATCH_COUNT];
+        memcpy(mismatched, r_points, sizeof(mismatched));
+        mismatched[0] = r_points[1];
+        CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r(
+            CTX, workspace, signatures, messages[0], pubkeys, mismatched, BATCH_COUNT) == 0);
+    }
+    {
+        secp256k1_pubkey wrong_parity[BATCH_COUNT];
+        secp256k1_ge point;
+        secp256k1_ge negated;
+        memcpy(wrong_parity, r_points, sizeof(wrong_parity));
+        CHECK(secp256k1_pubkey_load(CTX, &point, &wrong_parity[0]) == 1);
+        secp256k1_ge_neg(&negated, &point);
+        secp256k1_pubkey_save(&wrong_parity[0], &negated);
+        CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r(
+            CTX, workspace, signatures, messages[0], pubkeys, wrong_parity, BATCH_COUNT) == 0);
+    }
+    {
+        unsigned char noncanonical[BATCH_COUNT * 64];
+        memcpy(noncanonical, r_points_xy, sizeof(noncanonical));
+        memset(noncanonical, 0xff, 32);
+        CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r_xy(
+            CTX, workspace, signatures, messages[0], pubkeys, noncanonical, BATCH_COUNT) == 0);
+    }
+    {
+        unsigned char wrong_messages[BATCH_COUNT][32];
+        memcpy(wrong_messages, messages, sizeof(wrong_messages));
+        wrong_messages[3][7] ^= 1;
+        CHECK(secp256k1_ecdsa_recoverable_verify_batch_workspace_prepared_r_xy(
+            CTX, workspace, signatures, wrong_messages[0], pubkeys, r_points_xy, BATCH_COUNT) == 0);
+    }
+
+    secp256k1_ecdsa_recoverable_batch_workspace_destroy(CTX, workspace);
+}
+
 /* Tests several edge cases. */
 static void test_ecdsa_recovery_edge_cases(void) {
     const unsigned char msg32[32] = {
@@ -333,6 +447,7 @@ REPEAT_TEST_MULT(test_ecdsa_recovery_end_to_end, 64)
 static const struct tf_test_entry tests_recovery[] = {
     CASE1(test_ecdsa_recovery_api),
     CASE1(test_ecdsa_recovery_end_to_end),
+    CASE1(test_ecdsa_recoverable_batch_prepared_r),
     CASE1(test_ecdsa_recovery_edge_cases)
 };
 
